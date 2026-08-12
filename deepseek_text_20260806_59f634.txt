@@ -1,0 +1,66 @@
+4. Deploy. Once the service is live, your bot webhook will be automatically set.
+
+### 4. Frontend Deployment (GitHub Pages)
+1. Edit `frontend/app.js`:
+- Replace `SUPABASE_URL` and `SUPABASE_ANON_KEY` with your Supabase project’s values.
+- Set `API_BASE` to your Render backend URL (e.g., `https://your-app.onrender.com/api`).
+- Update `ADMIN_TELEGRAM_ID` to your Telegram user ID.
+- Update the `manifestUrl` in the TON Connect initialization to point to your own `manifest.json` once hosted.
+2. Host the contents of the `frontend/` folder on GitHub Pages:
+- Create a repository, enable Pages from the main branch.
+- Push the files.
+3. Once live, copy the URL (e.g., `https://yourusername.github.io/ton-subscription-app`).
+4. Go back to [@BotFather](https://t.me/BotFather), use `/setmenubutton` or `/setwebapp` to link your bot to this URL. Alternatively, use deep‑links.
+
+### 5. TON Connect Manifest
+The `manifest.json` must be accessible at the same origin as your Mini App (GitHub Pages). It is required for TON Connect to work. You already placed it in the frontend root.
+
+### 6. Configure Your Bot with Owners and Channels
+1. As a channel owner, add the bot to your private channel/group **as an administrator** with at least:
+- Add members (to generate invite links)
+- Delete messages (optional)
+2. The bot will automatically detect the addition and save the channel.
+3. Open the Mini App via the bot (or use the direct link) – you’ll be directed to the owner dashboard where you can set the subscription price and duration.
+4. Share the deep‑link ( `t.me/YourBot?start=CHANNEL_UUID` ) with your community.
+
+---
+
+## How It Works (Architecture)
+- **Bot webhook** is handled by Express. All bot commands (like `/start`) are processed.
+- **API endpoints** are secured with Telegram `initData` validation.
+- Payment flow:
+1. User selects a channel, clicks “Pay with TON”.
+2. Frontend requests a unique memo from backend.
+3. TON Connect pops up and user signs a transaction to the admin wallet.
+4. Frontend sends the signed `boc` to backend.
+5. Backend verifies the transaction on‑chain (via TON Center), records subscription and platform fee, and the bot sends an invite link to the user.
+- **Platform fee** (1%) is deducted from the total and tracked. The owner’s 99% stays as pending earnings until they request a withdrawal, which the admin can approve and pay out manually via the admin wallet.
+
+---
+
+## Security Considerations
+- Never expose the `SUPABASE_SERVICE_ROLE_KEY` in the frontend. Only the backend uses it.
+- The `BOT_TOKEN` must be kept secret; it’s used to validate `initData`.
+- For payout automation, the admin wallet private key should be stored in Render environment variables (not committed). In this template, `payout()` is a stub; implement a secure signing service or use a custodial wallet API.
+- Row‑level security on Supabase ensures that even if the anon key leaks, users can only see their own data.
+
+---
+
+## Customization
+- Modify the Tailwind theme or layout in `index.html`.
+- Add more complex subscription models (tiered pricing, free trials) by extending the database and API.
+- Implement automated owner payouts using a background job or a webhook that triggers when `platform_transactions` accumulate.
+
+---
+
+## Free Tier Limitations
+- **Supabase** free tier includes 500 MB database and 2 GB bandwidth, which is sufficient for testing and small production.
+- **Render** free web services sleep after 15 min of inactivity; first request may be slow. Upgrade to $7/month if needed.
+- **GitHub Pages** has a soft bandwidth limit but usually fine for static Mini App.
+
+---
+
+## Support
+If you encounter issues, open an issue on the GitHub repository.
+
+**Enjoy monetizing your Telegram community with TON!**

@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>TON Subscriptions</title>
+  
+  <!-- Tailwind CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Telegram Web App SDK -->
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <!-- TON Connect UI -->
+  <script src="https://unpkg.com/@tonconnect/ui@latest/dist/tonconnect-ui.min.js"></script>
+  <!-- Supabase JS client -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <!-- TonWeb (for comment encoding) -->
+  <script src="https://unpkg.com/tonweb@0.0.61/dist/tonweb.min.js"></script>
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+  
+  <style>
+    .glow-blue {
+      box-shadow: 0 0 20px -5px rgba(37, 99, 235, 0.4), 0 0 40px -10px rgba(37, 99, 235, 0.2);
+    }
+    .glow-emerald {
+      box-shadow: 0 0 20px -5px rgba(16, 185, 129, 0.3);
+    }
+    .status-dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 9999px;
+    }
+    .hidden-page { display: none; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 antialiased">
+
+  <!-- Frosted Glass Header -->
+  <header id="nav-bar" class="sticky top-0 z-50 backdrop-blur-md bg-slate-900/80 border-b border-slate-800 px-4 py-3 flex items-center justify-between hidden">
+    <div class="flex items-center gap-3">
+      <i data-lucide="zap" class="w-6 h-6 text-blue-400"></i>
+      <h1 class="text-lg font-bold text-white tracking-tight">TON <span class="text-blue-400">Subs</span></h1>
+    </div>
+    <nav class="flex gap-2">
+      <button id="nav-subscriptions" onclick="showPage('subscriptions')" class="px-3 py-1.5 text-xs font-medium rounded-full bg-slate-800 text-slate-300 hover:bg-slate-700 transition">My Subs</button>
+      <button id="nav-owner" onclick="showPage('owner')" class="px-3 py-1.5 text-xs font-medium rounded-full bg-slate-800 text-slate-300 hover:bg-slate-700 transition" style="display:none;">My Channels</button>
+      <button id="nav-admin" onclick="showPage('admin')" class="px-3 py-1.5 text-xs font-medium rounded-full bg-slate-800 text-slate-300 hover:bg-slate-700 transition" style="display:none;">Admin</button>
+    </nav>
+    <div id="ton-connect-button" class="flex-shrink-0"></div>
+  </header>
+
+  <main class="container mx-auto px-4 py-6 max-w-4xl">
+    
+    <!-- PURCHASE PAGE -->
+    <section id="page-purchase" class="hidden-page">
+      <div id="purchase-card" class="bg-slate-900 rounded-2xl border border-slate-800 p-6 max-w-md mx-auto shadow-lg">
+        <!-- dynamically populated -->
+      </div>
+    </section>
+
+    <!-- SUBSCRIPTIONS PAGE -->
+    <section id="page-subscriptions" class="hidden-page">
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-5 mb-8">
+        <div class="bg-slate-900 rounded-2xl border border-slate-800 p-5">
+          <p class="text-slate-500 text-xs uppercase tracking-wider font-semibold">Active Subs</p>
+          <p id="stat-active" class="text-3xl font-bold text-white mt-1">0</p>
+          <span class="inline-flex items-center gap-1 text-xs text-emerald-400 mt-2">+2 this month</span>
+        </div>
+        <div class="bg-slate-900 rounded-2xl border border-slate-800 p-5">
+          <p class="text-slate-500 text-xs uppercase tracking-wider font-semibold">Expiring Soon</p>
+          <p id="stat-expiring" class="text-3xl font-bold text-white mt-1">0</p>
+          <span class="inline-flex items-center gap-1 text-xs text-amber-400 mt-2">Next 7 days</span>
+        </div>
+        <div class="bg-slate-900 rounded-2xl border border-slate-800 p-5">
+          <p class="text-slate-500 text-xs uppercase tracking-wider font-semibold">Total Spent</p>
+          <p id="stat-spent" class="text-3xl font-bold text-white mt-1">0 TON</p>
+          <span class="inline-flex items-center gap-1 text-xs text-slate-400 mt-2">Lifetime</span>
+        </div>
+      </div>
+
+      <h2 class="text-xl font-bold mb-4 flex items-center gap-2"><i data-lucide="list" class="w-5 h-5 text-blue-400"></i> Your Subscriptions</h2>
+      <div id="subscriptions-list" class="space-y-3"></div>
+    </section>
+
+    <!-- OWNER DASHBOARD -->
+    <section id="page-owner" class="hidden-page">
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-5 mb-8">
+        <div class="bg-slate-900 rounded-2xl border border-slate-800 p-5">
+          <p class="text-slate-500 text-xs uppercase tracking-wider font-semibold">Total Channels</p>
+          <p id="owner-stat-channels" class="text-3xl font-bold text-white mt-1">0</p>
+        </div>
+        <div class="bg-slate-900 rounded-2xl border border-slate-800 p-5">
+          <p class="text-slate-500 text-xs uppercase tracking-wider font-semibold">Total Subscribers</p>
+          <p id="owner-stat-subs" class="text-3xl font-bold text-white mt-1">0</p>
+        </div>
+        <div class="bg-slate-900 rounded-2xl border border-slate-800 p-5">
+          <p class="text-slate-500 text-xs uppercase tracking-wider font-semibold">Earnings (pending)</p>
+          <p id="owner-stat-earnings" class="text-3xl font-bold text-white mt-1">0 TON</p>
+          <span class="text-xs text-slate-400">99% revenue</span>
+        </div>
+      </div>
+
+      <h2 class="text-xl font-bold mb-4 flex items-center gap-2"><i data-lucide="radio" class="w-5 h-5 text-blue-400"></i> Your Channels</h2>
+      <div id="channels-list" class="space-y-3 mb-8"></div>
+
+      <!-- Wallet Section (injected dynamically) -->
+      <div id="wallet-section" class="bg-slate-900 rounded-2xl border border-slate-800 p-5 mt-6"></div>
+      <div id="withdrawal-section" class="bg-slate-900 rounded-2xl border border-slate-800 p-5 mt-6"></div>
+    </section>
+
+    <!-- ADMIN DASHBOARD -->
+    <section id="page-admin" class="hidden-page">
+      <h2 class="text-xl font-bold mb-4 flex items-center gap-2"><i data-lucide="shield-alert" class="w-5 h-5 text-blue-400"></i> Reported Channels</h2>
+      <div id="admin-reports" class="space-y-3 mb-8"></div>
+
+      <h2 class="text-xl font-bold mb-4 flex items-center gap-2"><i data-lucide="wallet" class="w-5 h-5 text-blue-400"></i> Pending Withdrawals</h2>
+      <div id="admin-withdrawals" class="space-y-3"></div>
+    </section>
+
+  </main>
+
+  <!-- Edit Channel Modal -->
+  <div id="edit-modal" class="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm hidden flex items-center justify-center">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 w-full max-w-md mx-4">
+      <h2 class="text-xl font-bold mb-4">Edit Channel</h2>
+      <label class="block text-sm text-slate-400 mb-1">Subscription Price (TON)</label>
+      <input id="edit-price" type="number" step="0.01" class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white font-mono mb-3" />
+      <label class="block text-sm text-slate-400 mb-1">Duration (days)</label>
+      <input id="edit-duration" type="number" class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-white font-mono mb-3" />
+      <label class="flex items-center gap-2 text-sm text-slate-300 mb-4">
+        <input id="edit-renewal" type="checkbox" class="accent-blue-500" /> Auto renewal reminders
+      </label>
+      <div class="flex justify-end gap-2">
+        <button id="modal-cancel" class="px-4 py-2 bg-slate-800 text-slate-300 rounded-xl">Cancel</button>
+        <button id="modal-save" class="px-4 py-2 bg-blue-600 text-white rounded-xl shadow-lg shadow-blue-500/20">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Rating Modal -->
+  <div id="rating-modal" class="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm hidden flex items-center justify-center">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 w-full max-w-sm mx-4">
+      <h3 class="text-lg font-semibold mb-2">Rate this Channel</h3>
+      <div id="star-rating" class="flex gap-1 text-2xl mb-3"></div>
+      <textarea id="rating-comment" placeholder="Write a review..." class="w-full bg-slate-950 border border-slate-800 rounded-xl p-2 text-white text-sm mb-3" rows="2"></textarea>
+      <div class="flex justify-end gap-2">
+        <button onclick="closeRating()" class="px-4 py-2 bg-slate-800 text-slate-300 rounded-xl">Cancel</button>
+        <button onclick="submitRating()" class="px-4 py-2 bg-blue-600 text-white rounded-xl">Submit</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Report Modal -->
+  <div id="report-modal" class="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm hidden flex items-center justify-center">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 w-full max-w-sm mx-4">
+      <h3 class="text-lg font-semibold mb-2">Report Channel</h3>
+      <select id="report-reason" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-2 text-white text-sm mb-2">
+        <option value="scam">Scam</option>
+        <option value="inappropriate">Inappropriate Content</option>
+        <option value="insult">Insult</option>
+        <option value="racism">Racism</option>
+        <option value="other">Other</option>
+      </select>
+      <textarea id="report-description" placeholder="Additional details..." class="w-full bg-slate-950 border border-slate-800 rounded-xl p-2 text-white text-sm mb-3" rows="2"></textarea>
+      <div class="flex justify-end gap-2">
+        <button onclick="closeReport()" class="px-4 py-2 bg-slate-800 text-slate-300 rounded-xl">Cancel</button>
+        <button onclick="submitReport()" class="px-4 py-2 bg-red-600 text-white rounded-xl">Submit Report</button>
+      </div>
+    </div>
+  </div>
+
+  <footer class="sticky bottom-0 bg-slate-950/90 backdrop-blur-md border-t border-slate-800 px-4 py-2 flex items-center justify-between text-xs text-slate-500">
+    <div class="flex items-center gap-2">
+      <span class="status-dot bg-emerald-500"></span> TON Mainnet
+    </div>
+    <div>Platform fee 1%</div>
+    <div class="font-mono">v1.0</div>
+  </footer>
+
+  <script src="app.js"></script>
+  <script>
+    lucide.createIcons();
+  </script>
+</body>
+</html>
