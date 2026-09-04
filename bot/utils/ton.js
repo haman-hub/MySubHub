@@ -7,40 +7,51 @@ async function verifyPayment(boc, expectedAddress, expectedAmountNano, expectedM
       apiKey: process.env.TONCENTER_API_KEY
     }));
 
-    // 1. Send BOC to get transaction hash
-    const result = await tonweb.provider.sendBocReturnHash(boc);
-    const txHash = result; // result is a string hash
+    console.log('Verifying payment:');
+    console.log('Expected address:', expectedAddress);
+    console.log('Expected amount (nano):', expectedAmountNano.toString());
 
-    // 2. Poll for the transaction until it appears or timeout
-    const maxAttempts = 10;
+    // 1. Send BOC to get transaction hash
+    const txHash = await tonweb.provider.sendBocReturnHash(boc);
+    console.log('Transaction hash:', txHash);
+
+    // 2. Poll for the transaction (max 15 attempts, 2 sec each = 30 sec)
+    const maxAttempts = 15;
     const delayMs = 2000;
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       await new Promise(resolve => setTimeout(resolve, delayMs));
 
-      const txInfo = await tonweb.provider.getTransactions(expectedAddress, 10);
-      const txs = txInfo || [];
+      const txs = await tonweb.provider.getTransactions(expectedAddress, 10);
+      if (!txs || !txs.length) continue;
 
       const tx = txs.find(t => t.transaction_id.hash === txHash);
-      if (tx && tx.in_msg) {
-        const inMsg = tx.in_msg;
+      if (!tx || !tx.in_msg) continue;
 
-        // Parse addresses as raw hex (0:...) for comparison
-        const expectedRaw = TonWeb.utils.Address.parse(expectedAddress).toRawString();
-        const destRaw = TonWeb.utils.Address.parse(inMsg.destination).toRawString();
+      const inMsg = tx.in_msg;
 
-        // Compare amounts (as strings)
-        const expectedAmountStr = expectedAmountNano.toString();
-        const receivedAmountStr = inMsg.value.toString();
+      // Parse addresses to raw hex for comparison
+      const expectedRaw = TonWeb.utils.Address.parse(expectedAddress).toRawString();
+      const destRaw = TonWeb.utils.Address.parse(inMsg.destination).toRawString();
 
-        if (destRaw === expectedRaw && receivedAmountStr === expectedAmountStr) {
-          return { success: true, txHash };
-        }
-        return { success: false, error: 'Amount or destination mismatch' };
+      console.log('Found transaction:');
+      console.log('Destination raw:', destRaw);
+      console.log('Expected raw:', expectedRaw);
+      console.log('Amount received (nano):', inMsg.value.toString());
+      console.log('Amount expected (nano):', expectedAmountNano.toString());
+
+      if (destRaw === expectedRaw && inMsg.value.toString() === expectedAmountNano.toString()) {
+        return { success: true, txHash };
+      } else {
+        console.error('Mismatch in address or amount');
+        return { success: false, error: 'Mismatch in address or amount' };
       }
     }
-    return { success: false, error: 'Transaction not found or too many attempts' };
+
+    console.error('Transaction not found after polling');
+    return { success: false, error: 'Transaction not found after polling' };
   } catch (e) {
-    console.error('Payment verification error:', e);
+    console.error('Payment verification exception:', e);
     return { success: false, error: e.message };
   }
 }
