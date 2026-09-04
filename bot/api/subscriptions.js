@@ -6,20 +6,16 @@ const supabase = require('../utils/supabase');
 const { verifyPayment } = require('../utils/ton');
 const bot = require('../bot');
 
+const NETWORK_FEE_TON = 0.05; // <-- add this
+
 router.use(validateInitData);
 
 // GET user's subscriptions
 router.get('/my', async (req, res) => {
-  const userId = req.telegramUser.id;
-  const { data, error } = await supabase
-    .from('subscriptions')
-    .select('*, channel:channels(channel_name, channel_invite_link)')
-    .eq('user_id', userId);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
+  // ... unchanged
 });
 
-// POST initiate payment (return admin wallet & memo)
+// POST initiate payment
 router.post('/initiate', async (req, res) => {
   const { channel_id } = req.body;
   const userId = req.telegramUser.id;
@@ -31,23 +27,25 @@ router.post('/initiate', async (req, res) => {
     .single();
   if (error || !channel || !channel.is_active) return res.status(400).json({ error: 'Channel not available' });
 
-  const amountNano = TonWeb.utils.toNano(channel.subscription_price.toString()); // convert TON to nano
+  const platformFee = channel.subscription_price * 0.01;
+  const totalAmount = channel.subscription_price + platformFee + NETWORK_FEE_TON;
+  const amountNano = TonWeb.utils.toNano(totalAmount.toString()); // total in nanoTON
+
   const adminWallet = process.env.ADMIN_TON_WALLET;
-  const memo = `sub:${channel_id}:${userId}`;  // unique identifier
+  const memo = `sub:${channel_id}:${userId}`;
   res.json({
     wallet: adminWallet,
-    amount: channel.subscription_price,
-    amountNano: amountNano.toString(),
+    amount: totalAmount,                      // total TON
+    amountNano: amountNano.toString(),        // total nanoTON
     memo,
   });
 });
 
-// POST confirm payment (verify tx and activate subscription)
+// POST confirm payment
 router.post('/confirm', async (req, res) => {
   const { channel_id, boc } = req.body;
   const userId = req.telegramUser.id;
 
-  // Re-fetch channel to get latest price
   const { data: channel } = await supabase
     .from('channels')
     .select('*')
@@ -55,14 +53,16 @@ router.post('/confirm', async (req, res) => {
     .single();
   if (!channel) return res.status(404).json({ error: 'Channel not found' });
 
-  const expectedAmount = TonWeb.utils.toNano(channel.subscription_price.toString());
+  const platformFee = channel.subscription_price * 0.01;
+  const totalAmount = channel.subscription_price + platformFee + NETWORK_FEE_TON;
+  const expectedAmount = TonWeb.utils.toNano(totalAmount.toString());
   const expectedMemo = `sub:${channel_id}:${userId}`;
   const adminWallet = process.env.ADMIN_TON_WALLET;
 
-  const verification = await verifyPayment(boc, adminWallet, expectedAmount, expectedMemo);
+  const verification = await verifyPayment(boc, adminWallet, expectedAmount.toString(), expectedMemo);
   if (!verification.success) return res.status(400).json({ error: 'Payment verification failed' });
 
-  // Insert subscription
+   // Insert subscription
   const endDate = new Date();
   endDate.setDate(endDate.getDate() + channel.duration_days);
   const { data: sub, error: subErr } = await supabase
@@ -125,5 +125,6 @@ router.post('/renew', async (req, res) => {
   // For brevity, skipping full implementation – see pattern above.
   res.json({ success: true });
 });
+
 
 module.exports = router;
