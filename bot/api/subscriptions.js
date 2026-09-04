@@ -12,7 +12,16 @@ router.use(validateInitData);
 
 // GET user's subscriptions
 router.get('/my', async (req, res) => {
-  // ... unchanged
+  
+  const userId = req.telegramUser.id;
+  const { data, error } = await supabase
+    .from('subscriptions')
+    .select('*, channel:channels(channel_name, channel_invite_link)')
+    .eq('user_id', userId);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+
+
 });
 
 // POST initiate payment
