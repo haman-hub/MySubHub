@@ -1,66 +1,48 @@
-// bot/utils/ton.js
+// utils/ton.js
 const TonWeb = require('tonweb');
-const tonweb = new TonWeb(new TonWeb.HttpProvider('https://toncenter.com/api/v2/jsonRPC', {
-  apiKey: process.env.TONCENTER_API_KEY
-}));
 
-/**
- * Verify a payment transaction sent to the admin wallet.
- * @param {string} boc - Signed transaction BOC from TON Connect.
- * @param {string} expectedAddress - Admin wallet in raw form (e.g., UQ...)
- * @param {number} expectedAmount - Amount in nanoTON.
- * @param {string} expectedMemo - Memo string expected.
- * @returns {object} { success, txHash, message }
- */
-async function verifyPayment(boc, expectedAddress, expectedAmount, expectedMemo) {
+async function verifyPayment(boc, expectedAddress, expectedAmountNano, expectedMemo) {
   try {
-    const cell = TonWeb.boc.Cell.oneFromBoc(TonWeb.utils.base64ToBytes(boc));
-    const extMsg = await tonweb.contracts.createExternalMessage(cell);
+    const tonweb = new TonWeb(new TonWeb.HttpProvider('https://testnet.toncenter.com/api/v2/jsonRPC', {
+      apiKey: process.env.TONCENTER_API_KEY
+    }));
+
+    // 1. Send BOC to get transaction hash
     const result = await tonweb.provider.sendBocReturnHash(boc);
-    const txHash = result; // hex string
+    const txHash = result; // result is a string hash
 
-    // Wait for transaction to appear
-    await new Promise(resolve => setTimeout(resolve, 8000));
+    // 2. Poll for the transaction until it appears or timeout
+    const maxAttempts = 10;
+    const delayMs = 2000;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, delayMs));
 
-    const txList = await tonweb.provider.getTransactions(expectedAddress, 5);
-    const tx = txList.find(t => t.transaction_id.hash === txHash);
-    if (!tx) {
-      const latest = txList[0];
-      if (!latest) throw new Error('No transaction found');
-      if (latest.in_msg) {
-        const inMsg = latest.in_msg;
-        const destination = inMsg.destination;
-        const value = inMsg.value;
-        const msgBody = inMsg.message;
+      const txInfo = await tonweb.provider.getTransactions(expectedAddress, 10);
+      const txs = txInfo || [];
 
-        let comment = '';
-        try {
-          const bodyCell = TonWeb.boc.Cell.oneFromBoc(TonWeb.utils.base64ToBytes(msgBody));
-          let slice = bodyCell.beginParse();
-          let op = slice.loadUint(32);
-          if (op === 0) {
-            comment = slice.loadStringTail();
-          }
-        } catch (e) {}
+      const tx = txs.find(t => t.transaction_id.hash === txHash);
+      if (tx && tx.in_msg) {
+        const inMsg = tx.in_msg;
 
-        if (destination !== expectedAddress ||
-            value !== expectedAmount.toString() ||
-            comment !== expectedMemo) {
-          return { success: false, message: 'Transaction details do not match' };
+        // Parse addresses as raw hex (0:...) for comparison
+        const expectedRaw = TonWeb.utils.Address.parse(expectedAddress).toRawString();
+        const destRaw = TonWeb.utils.Address.parse(inMsg.destination).toRawString();
+
+        // Compare amounts (as strings)
+        const expectedAmountStr = expectedAmountNano.toString();
+        const receivedAmountStr = inMsg.value.toString();
+
+        if (destRaw === expectedRaw && receivedAmountStr === expectedAmountStr) {
+          return { success: true, txHash };
         }
-        return { success: true, txHash: txHash || latest.transaction_id.hash };
+        return { success: false, error: 'Amount or destination mismatch' };
       }
-      return { success: false, message: 'No incoming message detected' };
     }
-    return { success: true, txHash };
+    return { success: false, error: 'Transaction not found or too many attempts' };
   } catch (e) {
-    return { success: false, message: e.message };
+    console.error('Payment verification error:', e);
+    return { success: false, error: e.message };
   }
 }
 
-async function payout(address, amountNano) {
-  // Placeholder for actual payout using admin wallet private key
-  return null;
-}
-
-module.exports = { verifyPayment, payout };
+module.exports = { verifyPayment };
