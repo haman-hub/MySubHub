@@ -61,10 +61,17 @@ router.post('/confirm', async (req, res) => {
     .eq('id', channel_id)
     .single();
   if (!channel) return res.status(404).json({ error: 'Channel not found' });
+  console.log('Confirm payment for user', userId);
+  console.log('Channel price:', channel.subscription_price);
 
   const platformFee = channel.subscription_price * 0.01;
   const totalAmount = channel.subscription_price + platformFee + NETWORK_FEE_TON;
+  console.log('Total amount (TON):', totalAmount);
+  
   const expectedAmount = TonWeb.utils.toNano(totalAmount.toString());
+  console.log('Expected amount (nano):', expectedAmount.toString());
+  console.log('Admin wallet:', process.env.ADMIN_TON_WALLET);
+  
   const expectedMemo = `sub:${channel_id}:${userId}`;
   const adminWallet = process.env.ADMIN_TON_WALLET;
 
