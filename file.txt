@@ -1,0 +1,1270 @@
+import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+// ================== CONFIG ==================
+const BOT_TOKEN = Deno.env.get("BOT_TOKEN");
+const ADMIN_TELEGRAM_ID = Deno.env.get("ADMIN_TELEGRAM_ID");
+const ADMIN_TON_WALLET = Deno.env.get("ADMIN_TON_WALLET");
+const TONCENTER_API_KEY = Deno.env.get("TONCENTER_API_KEY");
+const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET");
+const WEBAPP_URL = Deno.env.get("WEBAPP_URL") || "https://haman-hub.github.io/MySubHub-frontend";
+const TON_NETWORK = Deno.env.get("TON_NETWORK") || "testnet";
+
+console.log(`🚀 Starting with TON_NETWORK: ${TON_NETWORK}`);
+
+if (!BOT_TOKEN || !ADMIN_TELEGRAM_ID || !ADMIN_TON_WALLET) {
+  console.error("❌ Missing required environment variables");
+}
+
+const TONCENTER_BASE = TON_NETWORK === "testnet"
+  ? "https://testnet.toncenter.com/api/v2"
+  : "https://toncenter.com/api/v2";
+
+const NETWORK_FEE_NANO = 50_000_000n;
+const PLATFORM_FEE_PERCENT = 0.01;
+
+const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+const supabaseServiceRole = Deno.env.get("SERVICE_ROLE_KEY") || Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+
+const supabase = createClient(supabaseUrl, supabaseServiceRole);
+
+// ================== DATABASE HELPER ==================
+async function dbQuery(table: string, options: {
+  select?: string;
+  filter?: string;
+  method?: 'GET' | 'POST' | 'PATCH' | 'DELETE';
+  body?: any;
+} = {}) {
+  const { select = '*', filter = '', method = 'GET', body = null } = options;
+  
+  let url = `${supabaseUrl}/rest/v1/${table}?select=${select}`;
+  if (filter) url += `&${filter}`;
+  
+  const headers: Record<string, string> = {
+    'apikey': supabaseServiceRole,
+    'Authorization': `Bearer ${supabaseServiceRole}`,
+    'Content-Type': 'application/json',
+  };
+  
+  if (method === 'POST' || method === 'PATCH') {
+    headers['Prefer'] = 'return=representation';
+  }
+  
+  const response = await fetch(url, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : null,
+  });
+  
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Database error: ${errorText}`);
+  }
+  
+  if (method === 'DELETE') return null;
+  
+  const responseText = await response.text();
+  if (!responseText) return [];
+  
+  try {
+    return JSON.parse(responseText);
+  } catch (e) {
+    throw new Error(`Invalid JSON response: ${responseText}`);
+  }
+}
+
+// ================== UUID VALIDATION ==================
+function isValidUUID(str: string): boolean {
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  return uuidRegex.test(str);
+}
+
+// ================== CORS ==================
+function getCorsHeaders(origin: string | null) {
+  const allowedOrigins = ["https://haman-hub.github.io", "https://web.telegram.org"];
+  const allowedOrigin = origin && allowedOrigins.some(o => origin.startsWith(o)) ? origin : "*";
+
+  return {
+    "Access-Control-Allow-Origin": allowedOrigin,
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, x-telegram-initdata, Authorization",
+    "Access-Control-Max-Age": "86400",
+  };
+}
+
+function jsonResponse(payload: any, status = 200, origin: string | null = null) {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: { "Content-Type": "application/json", ...getCorsHeaders(origin) },
+  });
+}
+
+// ================== RATE LIMITING ==================
+const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+
+function checkRateLimit(userId: string): boolean {
+  const now = Date.now();
+  const entry = rateLimitMap.get(userId);
+
+  if (!entry || now > entry.resetAt) {
+    rateLimitMap.set(userId, { count: 1, resetAt: now + 60000 });
+    return true;
+  }
+
+  if (entry.count >= 30) return false;
+  entry.count++;
+  return true;
+}
+
+// ================== TELEGRAM HELPERS ==================
+async function telegramApi(method: string, body: Record<string, unknown> = {}) {
+  if (!BOT_TOKEN) throw new Error("BOT_TOKEN not configured");
+  const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return res.json();
+}
+
+// ================== INITDATA VALIDATION ==================
+async function validateInitData(initData: string) {
+  try {
+    if (!initData || !BOT_TOKEN) return null;
+
+    const params = new URLSearchParams(initData);
+    const authDate = parseInt(params.get("auth_date") || "0", 10);
+    const now = Math.floor(Date.now() / 1000);
+
+    if (!authDate || now - authDate > 86400) return null;
+
+    const secretKey = await crypto.subtle.importKey(
+      "raw", new TextEncoder().encode("WebAppData"),
+      { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+    );
+    const key = await crypto.subtle.sign("HMAC", secretKey, new TextEncoder().encode(BOT_TOKEN));
+
+    const hash = params.get("hash");
+    params.delete("hash");
+    params.sort();
+
+    const dataCheckString = Array.from(params.entries()).map(([k, v]) => `${k}=${v}`).join("\n");
+
+    const hmac = await crypto.subtle.sign(
+      "HMAC",
+      await crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]),
+      new TextEncoder().encode(dataCheckString)
+    );
+
+    const calculatedHash = Array.from(new Uint8Array(hmac)).map(b => b.toString(16).padStart(2, "0")).join("");
+
+    if (calculatedHash !== hash) return null;
+
+    const userJson = params.get("user");
+    if (!userJson) return null;
+
+    return JSON.parse(userJson);
+  } catch (e) {
+    return null;
+  }
+}
+
+// ================== WEBHOOK VERIFICATION ==================
+function verifyWebhookSecret(headers: Headers): boolean {
+  if (!WEBHOOK_SECRET) return true;
+  return headers.get("X-Telegram-Bot-Api-Secret-Token") === WEBHOOK_SECRET;
+}
+
+// ================== TON PAYMENT VERIFICATION ==================
+async function verifyTonPayment(expectedAddress: string, expectedAmountNano: bigint): Promise<{ success: boolean; txHash?: string; error?: string }> {
+  try {
+    const txRes = await fetch(`${TONCENTER_BASE}/getTransactions?address=${expectedAddress}&limit=30`, {
+      headers: { "X-API-Key": TONCENTER_API_KEY || "" }
+    });
+    
+    const txData = await txRes.json();
+    if (!txData.ok || !txData.result) return { success: false, error: "Failed to fetch transactions" };
+
+    const tenMinutesAgo = Math.floor(Date.now() / 1000) - 600;
+
+    for (const tx of txData.result) {
+      if (tx.utime < tenMinutesAgo) continue;
+      const inMsg = tx.in_msg;
+      if (!inMsg || !inMsg.value) continue;
+
+      try {
+        const receivedAmount = BigInt(inMsg.value);
+        if (receivedAmount >= expectedAmountNano) {
+          const existing = await dbQuery("subscriptions", { 
+            select: 'id',
+            filter: `transaction_hash=eq.${tx.transaction_id.hash}`
+          });
+          if (existing && existing.length > 0) continue;
+          return { success: true, txHash: tx.transaction_id.hash };
+        }
+      } catch { continue; }
+    }
+
+    return { success: false, error: "No matching transaction found" };
+  } catch (e) {
+    return { success: false, error: `Verification error: ${e.message}` };
+  }
+}
+
+// ================== CHANNEL POST INTEGRATION ==================
+async function postToChannel(channelChatId: number, message: string) {
+  try {
+    const result = await telegramApi("sendMessage", {
+      chat_id: channelChatId,
+      text: message,
+      parse_mode: "HTML",
+    });
+    return result.ok;
+  } catch (e) {
+    console.error("Failed to post to channel:", e);
+    return false;
+  }
+}
+
+// ================== SET BOT COMMANDS (run once on deployment) ==================
+async function setBotCommands() {
+  if (!BOT_TOKEN) return;
+  
+  try {
+    await telegramApi("setMyCommands", {
+      commands: [
+        { command: "start", description: "🚀 Open MySubHub Dashboard" },
+        { command: "help", description: "📚 How to use MySubHub" },
+        { command: "mychannels", description: "📺 Manage my channels" },
+        { command: "mysubs", description: "📋 View my subscriptions" },
+      ],
+    });
+    
+    // Set bot menu button (opens webapp)
+    await telegramApi("setChatMenuButton", {
+      menu_button: {
+        type: "web_app",
+        text: "📱 Open MySubHub",
+        web_app: { url: WEBAPP_URL },
+      },
+    });
+    
+    console.log("✅ Bot commands and menu button set successfully");
+  } catch (e) {
+    console.error("❌ Failed to set bot commands:", e);
+  }
+}
+
+// ================== BOT WEBHOOK HANDLER ==================
+async function handleBotUpdate(body: any) {
+  if (body.message?.text?.startsWith("/start")) {
+    const chatId = body.message.chat.id;
+    const from = body.message.from;
+    const lang = from.language_code;
+
+    try {
+      await dbQuery("users", {
+        method: 'POST',
+        body: {
+          telegram_id: from.id,
+          first_name: from.first_name,
+          last_name: from.last_name,
+          username: from.username,
+          language_code: lang,
+        }
+      });
+    } catch (e) {
+      try {
+        await dbQuery("users", {
+          method: 'PATCH',
+          filter: `telegram_id=eq.${from.id}`,
+          body: { first_name: from.first_name, last_name: from.last_name, username: from.username, language_code: lang }
+        });
+      } catch (e2) {}
+    }
+
+    // Create user preferences if not exists
+    try {
+      await dbQuery("user_preferences", {
+        method: 'POST',
+        body: { user_id: from.id, theme: 'dark', tutorial_completed: false }
+      });
+    } catch (e) {
+      // Already exists
+    }
+
+    const text = body.message.text;
+    
+    // Handle /help command
+    if (text.startsWith("/help")) {
+      await telegramApi("sendMessage", {
+        chat_id: chatId,
+        text: `📚 *How to Use MySubHub*\n\nChoose a guide:\n\n👤 *Subscribers* - Learn how to subscribe to channels\n📺 *Channel Owners* - Learn how to monetize your channel\n\nClick a button below to open the guide:`,
+        parse_mode: "Markdown",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "👤 Subscriber Guide", web_app: { url: `${WEBAPP_URL}?startapp=help-subscriber` } },
+            ],
+            [
+              { text: "📺 Channel Owner Guide", web_app: { url: `${WEBAPP_URL}?startapp=help-owner` } },
+            ],
+            [
+              { text: "🏠 Open Dashboard", web_app: { url: WEBAPP_URL } },
+            ],
+          ],
+        },
+      });
+      return;
+    }
+    
+    // Handle /mychannels command
+    if (text.startsWith("/mychannels")) {
+      await telegramApi("sendMessage", {
+        chat_id: chatId,
+        text: `📺 *Your Channels*\n\nManage your channels, set prices, and track earnings.`,
+        parse_mode: "Markdown",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "📺 Open My Channels", web_app: { url: `${WEBAPP_URL}?startapp=owner` } },
+            ],
+          ],
+        },
+      });
+      return;
+    }
+    
+    // Handle /mysubs command
+    if (text.startsWith("/mysubs")) {
+      await telegramApi("sendMessage", {
+        chat_id: chatId,
+        text: `📋 *Your Subscriptions*\n\nView and manage your active subscriptions.`,
+        parse_mode: "Markdown",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "📋 View My Subscriptions", web_app: { url: `${WEBAPP_URL}?startapp=subscriptions` } },
+            ],
+          ],
+        },
+      });
+      return;
+    }
+    
+    const parts = text.replace(/^\/start(?:@\w+)?\s*/, "").trim();
+
+    let url = WEBAPP_URL;
+    let messageText = `Welcome, ${from.first_name}! 🎉\n\nUse the button below to open the dashboard.`;
+    let buttonText = "Open Dashboard";
+    let referredBy = null;
+
+    // Check if this is a referral link (format: ref_XXXXXXXX)
+    if (parts && parts.startsWith("ref_")) {
+      const referralCode = parts.replace("ref_", "");
+      
+      // Look up the referrer by referral code
+      try {
+        const referrers = await dbQuery("users", { 
+          select: 'telegram_id', 
+          filter: `referral_code=eq.${referralCode}` 
+        });
+        
+        if (referrers.length > 0) {
+          referredBy = referrers[0].telegram_id;
+          
+          // Update user with referred_by
+          await dbQuery("users", {
+            method: 'PATCH',
+            filter: `telegram_id=eq.${from.id}`,
+            body: { referred_by: referredBy }
+          });
+          
+          console.log(`✅ User ${from.id} was referred by ${referredBy}`);
+        }
+      } catch (e) {
+        console.error("Error processing referral:", e);
+      }
+    }
+
+    if (parts) {
+      if (parts === "owner") {
+        url += "?startapp=owner";
+        messageText = `Welcome, ${from.first_name}! Manage your channels:`;
+        buttonText = "Configure";
+      } else if (parts === "admin") {
+        url += "?startapp=admin";
+        messageText = `Admin panel access.`;
+        buttonText = "Open Admin";
+      } else if (parts.startsWith("ref_")) {
+        // Referral link - just open dashboard
+        url += "?startapp=referral";
+        messageText = `Welcome, ${from.first_name}! 🎉\n\nYou've been invited to MySubHub!`;
+        buttonText = "Open Dashboard";
+      } else {
+        url += `?startapp=${parts}`;
+        messageText = `Subscribe to this channel:`;
+        buttonText = "Open Subscription";
+      }
+    }
+
+    await telegramApi("sendMessage", {
+      chat_id: chatId,
+      text: messageText,
+      reply_markup: { inline_keyboard: [[{ text: buttonText, web_app: { url } }]] }
+    });
+  }
+
+  // Handle both channels and groups
+  if (body.my_chat_member) {
+    const update = body.my_chat_member;
+    const chat = update.chat;
+    
+    if (update.new_chat_member.status === "administrator" && (chat.type === "channel" || chat.type === "group" || chat.type === "supergroup")) {
+      const ownerId = update.from.id;
+      const lang = update.from.language_code;
+      const chatType = chat.type === "group" || chat.type === "supergroup" ? "group" : "channel";
+      
+      let inviteLink = "";
+      try {
+        const res = await telegramApi("createChatInviteLink", { chat_id: chat.id, member_limit: 0 });
+        inviteLink = res.result?.invite_link || "";
+      } catch {
+        try {
+          const res = await telegramApi("exportChatInviteLink", { chat_id: chat.id });
+          inviteLink = res.result || "";
+        } catch {}
+      }
+
+      try {
+        await dbQuery("users", {
+          method: 'POST',
+          body: { telegram_id: ownerId, first_name: update.from.first_name, last_name: update.from.last_name, username: update.from.username, language_code: lang }
+        });
+      } catch (e) {}
+
+      try {
+        const existingChannels = await dbQuery("channels", { select: 'id', filter: `channel_chat_id=eq.${chat.id}` });
+        const existingChannel = existingChannels[0];
+
+        if (existingChannel) {
+          await dbQuery("channels", {
+            method: 'PATCH',
+            filter: `id=eq.${existingChannel.id}`,
+            body: { channel_name: chat.title, channel_invite_link: inviteLink, is_active: false, owner_id: ownerId, channel_type: chatType }
+          });
+        } else {
+          await dbQuery("channels", {
+            method: 'POST',
+            body: {
+              channel_chat_id: chat.id,
+              owner_id: ownerId,
+              channel_name: chat.title,
+              channel_invite_link: inviteLink,
+              is_active: false,
+              subscription_price: 0.1,
+              duration_days: 30,
+              channel_type: chatType,
+            }
+          });
+        }
+      } catch (e) {}
+
+      const typeLabel = chatType === "group" ? "group" : "channel";
+      await telegramApi("sendMessage", {
+        chat_id: ownerId,
+        text: `✅ Bot added to ${typeLabel} "${chat.title}".\nSet your subscription price in the dashboard.`,
+        reply_markup: { inline_keyboard: [[{ text: "Configure", web_app: { url: WEBAPP_URL + "?startapp=owner" } }]] }
+      });
+    }
+  }
+}
+
+// ================== API ROUTER ==================
+async function apiHandler(path: string, method: string, headers: Headers, body: any, origin: string | null) {
+  const initData = headers.get("x-telegram-initdata") || "";
+  let user = null;
+
+  const isPublicEndpoint = (path === "/api/reviews" && method === "GET") || 
+                           (path.match(/^\/api\/reviews\/[a-f0-9-]+$/) && method === "GET");
+
+  if (!isPublicEndpoint) {
+    user = await validateInitData(initData);
+    if (!user) return jsonResponse({ error: "Unauthorized" }, 401, origin);
+    if (!checkRateLimit(user.id.toString())) return jsonResponse({ error: "Rate limit exceeded" }, 429, origin);
+  }
+
+  // ================== USER PREFERENCES ==================
+  if (path === "/api/user/preferences" && method === "GET") {
+    try {
+      const prefs = await dbQuery("user_preferences", { filter: `user_id=eq.${user.id}` });
+      return jsonResponse(prefs[0] || { theme: 'dark', tutorial_completed: false }, 200, origin);
+    } catch (e) {
+      return jsonResponse({ theme: 'dark', tutorial_completed: false }, 200, origin);
+    }
+  }
+
+  if (path === "/api/user/preferences" && method === "POST") {
+    const { theme, tutorial_completed, notifications_enabled, language } = body;
+    try {
+      const existing = await dbQuery("user_preferences", { filter: `user_id=eq.${user.id}` });
+      
+      if (existing.length > 0) {
+        const updates: any = {};
+        if (theme !== undefined) updates.theme = theme;
+        if (tutorial_completed !== undefined) updates.tutorial_completed = tutorial_completed;
+        if (notifications_enabled !== undefined) updates.notifications_enabled = notifications_enabled;
+        if (language !== undefined) updates.language = language;
+        updates.updated_at = new Date().toISOString();
+        
+        await dbQuery("user_preferences", { method: 'PATCH', filter: `user_id=eq.${user.id}`, body: updates });
+      } else {
+        await dbQuery("user_preferences", {
+          method: 'POST',
+          body: { user_id: user.id, theme: theme || 'dark', tutorial_completed: tutorial_completed || false }
+        });
+      }
+      
+      return jsonResponse({ success: true }, 200, origin);
+    } catch (e) {
+      return jsonResponse({ error: e.message }, 500, origin);
+    }
+  }
+
+  // ================== AUTH ==================
+  if (path === "/api/auth/validate" && method === "POST") {
+    try {
+      await dbQuery("users", {
+        method: 'POST',
+        body: { telegram_id: user.id, first_name: user.first_name, last_name: user.last_name, username: user.username, language_code: user.language_code }
+      });
+    } catch (e) {
+      try {
+        await dbQuery("users", {
+          method: 'PATCH',
+          filter: `telegram_id=eq.${user.id}`,
+          body: { first_name: user.first_name, last_name: user.last_name, username: user.username, language_code: user.language_code }
+        });
+      } catch (e2) {}
+    }
+
+    let dbUser;
+    try {
+      const users = await dbQuery("users", { filter: `telegram_id=eq.${user.id}` });
+      dbUser = users[0];
+    } catch (e) {}
+
+    return jsonResponse({ user: dbUser || user, is_admin: user.id.toString() === ADMIN_TELEGRAM_ID }, 200, origin);
+  }
+
+  if (path === "/api/auth/wallet" && method === "POST") {
+    const { wallet_address } = body;
+    if (!wallet_address) return jsonResponse({ error: "Missing wallet_address" }, 400, origin);
+    try {
+      await dbQuery("users", { method: 'PATCH', filter: `telegram_id=eq.${user.id}`, body: { wallet_address } });
+      return jsonResponse({ success: true }, 200, origin);
+    } catch (e) {
+      return jsonResponse({ error: e.message }, 500, origin);
+    }
+  }
+
+  // ================== CHANNELS (with pagination) ==================
+  if (path === "/api/channels/my" && method === "GET") {
+    try {
+      const channels = await dbQuery("channels", { filter: `owner_id=eq.${user.id}` });
+      
+      const channelsWithAnalytics = await Promise.all(
+        channels.map(async (ch: any) => {
+          const subs = await dbQuery("subscriptions", { filter: `channel_id=eq.${ch.id}` });
+          const activeSubs = subs.filter((s: any) => s.status === 'active');
+          const reviews = await dbQuery("reviews", { filter: `channel_id=eq.${ch.id}` });
+          
+          const avgRating = reviews.length > 0 
+            ? reviews.reduce((sum: number, r: any) => sum + r.rating, 0) / reviews.length 
+            : 0;
+          
+          return {
+            ...ch,
+            total_subscribers: subs.length,
+            active_subscribers: activeSubs.length,
+            avg_rating: avgRating.toFixed(1),
+            total_reviews: reviews.length
+          };
+        })
+      );
+      
+      return jsonResponse(channelsWithAnalytics || [], 200, origin);
+    } catch (e) {
+      return jsonResponse({ error: e.message }, 500, origin);
+    }
+  }
+
+  if (path === "/api/channels/register" && method === "POST") {
+    const { channel_name, channel_invite_link, subscription_price, duration_days, is_active, channel_type } = body;
+    if (!channel_name || !channel_invite_link) return jsonResponse({ error: "Missing fields" }, 400, origin);
+    
+    const price = subscription_price ? parseFloat(subscription_price) : 0.1;
+    const duration = duration_days ? parseInt(duration_days, 10) : 30;
+    const active = is_active !== undefined ? is_active : false;
+    const type = channel_type || 'channel';
+    
+    if (price <= 0) return jsonResponse({ error: "Price must be > 0" }, 400, origin);
+    if (duration <= 0) return jsonResponse({ error: "Duration must be > 0" }, 400, origin);
+    
+    try {
+      const [channel] = await dbQuery("channels", {
+        method: 'POST',
+        body: {
+          owner_id: user.id, channel_name, channel_invite_link, channel_chat_id: null,
+          is_active: active, subscription_price: price, duration_days: duration, channel_type: type,
+        }
+      });
+      return jsonResponse(channel, 200, origin);
+    } catch (e) {
+      return jsonResponse({ error: e.message }, 500, origin);
+    }
+  }
+
+  if (path.match(/^\/api\/channels\/[a-f0-9-]+$/) && method === "PUT") {
+    const channelId = path.split("/").pop()!;
+    if (!isValidUUID(channelId)) return jsonResponse({ error: "Invalid channel ID" }, 400, origin);
+    
+    try {
+      const channels = await dbQuery("channels", { filter: `id=eq.${channelId}` });
+      const ch = channels[0];
+      if (!ch || ch.owner_id !== user.id) return jsonResponse({ error: "Forbidden" }, 403, origin);
+
+      const updates: any = {};
+      if (body.subscription_price !== undefined) updates.subscription_price = parseFloat(body.subscription_price);
+      if (body.duration_days !== undefined) updates.duration_days = parseInt(body.duration_days, 10);
+      if (body.auto_renewal_reminders !== undefined) updates.auto_renewal_reminders = body.auto_renewal_reminders;
+      if (body.is_active !== undefined) updates.is_active = body.is_active;
+      if (body.auto_post_enabled !== undefined) updates.auto_post_enabled = body.auto_post_enabled;
+      if (body.auto_post_template !== undefined) updates.auto_post_template = body.auto_post_template;
+
+      await dbQuery("channels", { method: 'PATCH', filter: `id=eq.${channelId}`, body: updates });
+      return jsonResponse({ success: true }, 200, origin);
+    } catch (e) {
+      return jsonResponse({ error: e.message }, 500, origin);
+    }
+  }
+
+  if (path.match(/^\/api\/channels\/[a-f0-9-]+$/) && method === "GET") {
+    const channelId = path.split("/").pop()!;
+    if (!isValidUUID(channelId)) return jsonResponse({ error: "Invalid channel ID" }, 400, origin);
+    
+    try {
+      const channels = await dbQuery("channels", { filter: `id=eq.${channelId}` });
+      const channel = channels[0];
+      if (!channel) return jsonResponse({ error: "Channel not found" }, 404, origin);
+      
+      const reviews = await dbQuery("reviews", { filter: `channel_id=eq.${channelId}` });
+      const avgRating = reviews.length > 0 
+        ? reviews.reduce((sum: number, r: any) => sum + r.rating, 0) / reviews.length 
+        : 0;
+      
+      return jsonResponse({
+        ...channel,
+        avg_rating: avgRating.toFixed(1),
+        total_reviews: reviews.length
+      }, 200, origin);
+    } catch (e) {
+      return jsonResponse({ error: e.message }, 500, origin);
+    }
+  }
+
+  // ================== VERIFICATION ==================
+  if (path === "/api/channels/verify/request" && method === "POST") {
+    const { channel_id, evidence } = body;
+    if (!channel_id || !evidence) return jsonResponse({ error: "Missing fields" }, 400, origin);
+    
+    try {
+      const channels = await dbQuery("channels", { filter: `id=eq.${channel_id}` });
+      const channel = channels[0];
+      if (!channel || channel.owner_id !== user.id) return jsonResponse({ error: "Forbidden" }, 403, origin);
+      
+      if (channel.is_verified) return jsonResponse({ error: "Channel already verified" }, 400, origin);
+      
+      const [request] = await dbQuery("verification_requests", {
+        method: 'POST',
+        body: { channel_id, owner_id: user.id, evidence }
+      });
+      
+      return jsonResponse({ success: true, request }, 200, origin);
+    } catch (e) {
+      return jsonResponse({ error: e.message }, 500, origin);
+    }
+  }
+
+  // ================== SUBSCRIPTIONS (with pagination) ==================
+  if (path === "/api/subscriptions/initiate" && method === "POST") {
+    const { channel_id } = body;
+    if (!isValidUUID(channel_id)) return jsonResponse({ error: "Invalid channel ID" }, 400, origin);
+    
+    try {
+      const channels = await dbQuery("channels", { filter: `id=eq.${channel_id}` });
+      const channel = channels[0];
+      
+      if (!channel) return jsonResponse({ error: "Channel not found" }, 404, origin);
+      if (!channel.is_active) return jsonResponse({ error: "Channel not available" }, 400, origin);
+
+      const owners = await dbQuery("users", { filter: `telegram_id=eq.${channel.owner_id}` });
+      const owner = owners[0];
+      
+      if (!owner?.wallet_address) return jsonResponse({ error: "Channel owner has not set up wallet" }, 400, origin);
+
+      const basePriceNano = BigInt(Math.round(channel.subscription_price * 1e9));
+      const platformFeeNano = BigInt(Math.round(Number(basePriceNano) * PLATFORM_FEE_PERCENT));
+      const totalNano = basePriceNano + NETWORK_FEE_NANO;
+
+      return jsonResponse({
+        wallet: owner.wallet_address,
+        platform_wallet: ADMIN_TON_WALLET,
+        amount: Number(totalNano) / 1e9,
+        amountNano: totalNano.toString(),
+        network: TON_NETWORK,
+      }, 200, origin);
+    } catch (e) {
+      return jsonResponse({ error: e.message }, 500, origin);
+    }
+  }
+
+  if (path === "/api/subscriptions/confirm" && method === "POST") {
+    const { channel_id, boc, credits_used } = body;
+    if (!isValidUUID(channel_id)) return jsonResponse({ error: "Invalid channel ID" }, 400, origin);
+    
+    try {
+      const channels = await dbQuery("channels", { filter: `id=eq.${channel_id}` });
+      const channel = channels[0];
+      if (!channel) return jsonResponse({ error: "Channel not found" }, 404, origin);
+
+      const basePriceNano = BigInt(Math.round(channel.subscription_price * 1e9));
+      const platformFeeNano = BigInt(Math.round(Number(basePriceNano) * PLATFORM_FEE_PERCENT));
+      const totalNano = basePriceNano + NETWORK_FEE_NANO;
+
+      // Check if user wants to use credits
+      let creditsAmount = 0;
+      if (credits_used && credits_used > 0) {
+        const credits = await dbQuery("referral_credits", { filter: `user_id=eq.${user.id}` });
+        const balance = credits[0]?.balance || 0;
+        
+        if (balance >= credits_used) {
+          creditsAmount = credits_used;
+          
+          // Deduct credits
+          await dbQuery("referral_credits", {
+            method: 'PATCH',
+            filter: `user_id=eq.${user.id}`,
+            body: { 
+              balance: balance - credits_used,
+              total_used: (credits[0]?.total_used || 0) + credits_used,
+              updated_at: new Date().toISOString()
+            }
+          });
+        }
+      }
+
+      // Calculate remaining amount to pay with TON
+      const remainingAmount = Number(totalNano) / 1e9 - creditsAmount;
+      const remainingAmountNano = BigInt(Math.round(remainingAmount * 1e9));
+
+      // Verify TON payment (if any remaining amount)
+      let txHash = null;
+      if (remainingAmount > 0) {
+        const result = await verifyTonPayment(ADMIN_TON_WALLET!, remainingAmountNano);
+        if (!result.success) return jsonResponse({ error: result.error || "Payment verification failed" }, 400, origin);
+        txHash = result.txHash!;
+      }
+
+      const endDate = new Date();
+      endDate.setDate(endDate.getDate() + channel.duration_days);
+
+      const [sub] = await dbQuery("subscriptions", {
+        method: 'POST',
+        body: {
+          user_id: user.id, channel_id,
+          start_date: new Date().toISOString(), end_date: endDate.toISOString(),
+          transaction_hash: txHash || 'credits_only', 
+          amount: Number(totalNano) / 1e9, 
+          credits_used: creditsAmount,
+          status: "active", 
+          reminder_count: 0,
+        }
+      });
+
+      await dbQuery("platform_transactions", {
+        method: 'POST',
+        body: {
+          subscription_id: sub.id, user_id: user.id, channel_id, channel_owner_id: channel.owner_id,
+          amount_total: Number(totalNano) / 1e9, owner_share: Number(basePriceNano - platformFeeNano) / 1e9,
+          platform_fee: (Number(platformFeeNano) + Number(NETWORK_FEE_NANO)) / 1e9,
+          transaction_hash: txHash || 'credits_only', owner_paid_out: false,
+        }
+      });
+
+      // Record credit transaction if credits were used
+      if (creditsAmount > 0) {
+        const credits = await dbQuery("referral_credits", { filter: `user_id=eq.${user.id}` });
+        await dbQuery("credit_transactions", {
+          method: 'POST',
+          body: {
+            user_id: user.id,
+            type: 'used',
+            amount: creditsAmount,
+            balance_after: credits[0]?.balance || 0,
+            description: 'Credits used for subscription',
+            reference_id: sub.id
+          }
+        });
+      }
+
+      // Check if user was referred and award credits to referrer
+      const users = await dbQuery("users", { select: 'referred_by', filter: `telegram_id=eq.${user.id}` });
+      const referredBy = users[0]?.referred_by;
+      
+      if (referredBy) {
+        // Calculate 5% referral credit
+        const referralCredit = Number(totalNano) / 1e9 * 0.05;
+        
+        // Create referral record
+        await dbQuery("referrals", {
+          method: 'POST',
+          body: {
+            referrer_id: referredBy,
+            referred_id: user.id,
+            subscription_id: sub.id,
+            subscription_amount: Number(totalNano) / 1e9,
+            credits_earned: referralCredit,
+            status: 'completed'
+          }
+        });
+        
+        // Update referrer's credit balance
+        const referrerCredits = await dbQuery("referral_credits", { filter: `user_id=eq.${referredBy}` });
+        
+        if (referrerCredits.length > 0) {
+          await dbQuery("referral_credits", {
+            method: 'PATCH',
+            filter: `user_id=eq.${referredBy}`,
+            body: { 
+              balance: (referrerCredits[0]?.balance || 0) + referralCredit,
+              total_earned: (referrerCredits[0]?.total_earned || 0) + referralCredit,
+              updated_at: new Date().toISOString()
+            }
+          });
+        } else {
+          await dbQuery("referral_credits", {
+            method: 'POST',
+            body: {
+              user_id: referredBy,
+              balance: referralCredit,
+              total_earned: referralCredit,
+              total_used: 0
+            }
+          });
+        }
+        
+        // Record credit transaction for referrer
+        const updatedCredits = await dbQuery("referral_credits", { filter: `user_id=eq.${referredBy}` });
+        await dbQuery("credit_transactions", {
+          method: 'POST',
+          body: {
+            user_id: referredBy,
+            type: 'earned',
+            amount: referralCredit,
+            balance_after: updatedCredits[0]?.balance || 0,
+            description: `Referral credit from user ${user.id}`,
+            reference_id: sub.id
+          }
+        });
+      }
+
+      // Add user to channel
+      if (channel.channel_chat_id) {
+        try {
+          await telegramApi('unbanChatMember', { chat_id: channel.channel_chat_id, user_id: user.id, only_if_banned: false });
+          
+          // Auto-post if enabled
+          if (channel.auto_post_enabled && channel.auto_post_template) {
+            const users = await dbQuery("users", { filter: `telegram_id=eq.${user.id}` });
+            const subscriber = users[0];
+            const message = channel.auto_post_template
+              .replace('{user}', subscriber?.first_name || 'User')
+              .replace('{channel}', channel.channel_name)
+              .replace('{date}', new Date().toLocaleDateString());
+            
+            await postToChannel(channel.channel_chat_id, message);
+            await dbQuery("channels", { method: 'PATCH', filter: `id=eq.${channel_id}`, body: { last_posted_at: new Date().toISOString() } });
+          }
+        } catch (e) {
+          console.error("Error adding user to channel:", e);
+        }
+      }
+
+      return jsonResponse({ success: true, subscription: sub, creditsUsed: creditsAmount }, 200, origin);
+    } catch (e) {
+      return jsonResponse({ error: e.message }, 500, origin);
+    }
+  }
+
+  if (path === "/api/subscriptions/my" && method === "GET") {
+    try {
+      const subscriptions = await dbQuery("subscriptions", { filter: `user_id=eq.${user.id}&order=created_at.desc` });
+      
+      const subsWithChannels = await Promise.all(
+        (subscriptions || []).map(async (sub: any) => {
+          try {
+            const channels = await dbQuery("channels", { select: 'channel_name,channel_invite_link,is_verified', filter: `id=eq.${sub.channel_id}` });
+            return { ...sub, channel: channels[0] || null };
+          } catch (e) {
+            return { ...sub, channel: null };
+          }
+        })
+      );
+      
+      return jsonResponse(subsWithChannels || [], 200, origin);
+    } catch (e) {
+      return jsonResponse({ error: e.message }, 500, origin);
+    }
+  }
+
+  // ================== REFERRAL SYSTEM ==================
+  // Get user's referral link and stats
+  if (path === "/api/referrals/stats" && method === "GET") {
+    try {
+      // Get user's referral code
+      const users = await dbQuery("users", { select: 'referral_code', filter: `telegram_id=eq.${user.id}` });
+      const referralCode = users[0]?.referral_code;
+      
+      // Get referral stats using database function
+      const stats = await dbQuery("referrals", { 
+        select: 'id,referrer_id,referred_id,subscription_amount,credits_earned,created_at',
+        filter: `referrer_id=eq.${user.id}&order=created_at.desc`
+      });
+      
+      // Get credit balance
+      const credits = await dbQuery("referral_credits", { filter: `user_id=eq.${user.id}` });
+      const balance = credits[0]?.balance || 0;
+      const totalEarned = credits[0]?.total_earned || 0;
+      const totalUsed = credits[0]?.total_used || 0;
+      
+      // Calculate total credits earned from referrals
+      const totalCreditsEarned = stats.reduce((sum: number, r: any) => sum + parseFloat(r.credits_earned), 0);
+      
+      return jsonResponse({
+        referralCode,
+        referralLink: `${WEBAPP_URL}?ref=${referralCode}`,
+        totalReferrals: stats.length,
+        totalCreditsEarned,
+        currentBalance: balance,
+        totalUsed,
+        referrals: stats
+      }, 200, origin);
+    } catch (e) {
+      return jsonResponse({ error: e.message }, 500, origin);
+    }
+  }
+
+  // Use credits for subscription
+  if (path === "/api/referrals/use-credits" && method === "POST") {
+    const { subscription_id, amount } = body;
+    
+    if (!isValidUUID(subscription_id)) {
+      return jsonResponse({ error: "Invalid subscription ID" }, 400, origin);
+    }
+    
+    if (!amount || amount <= 0) {
+      return jsonResponse({ error: "Invalid amount" }, 400, origin);
+    }
+    
+    try {
+      // Check if user has enough credits
+      const credits = await dbQuery("referral_credits", { filter: `user_id=eq.${user.id}` });
+      const balance = credits[0]?.balance || 0;
+      
+      if (balance < amount) {
+        return jsonResponse({ error: "Insufficient credits" }, 400, origin);
+      }
+      
+      // Deduct credits
+      await dbQuery("referral_credits", {
+        method: 'PATCH',
+        filter: `user_id=eq.${user.id}`,
+        body: { 
+          balance: balance - amount,
+          total_used: (credits[0]?.total_used || 0) + amount,
+          updated_at: new Date().toISOString()
+        }
+      });
+      
+      // Create transaction record
+      await dbQuery("credit_transactions", {
+        method: 'POST',
+        body: {
+          user_id: user.id,
+          type: 'used',
+          amount: amount,
+          balance_after: balance - amount,
+          description: 'Credits used for subscription',
+          reference_id: subscription_id
+        }
+      });
+      
+      return jsonResponse({ success: true, newBalance: balance - amount }, 200, origin);
+    } catch (e) {
+      return jsonResponse({ error: e.message }, 500, origin);
+    }
+  }
+
+  // Get credit transaction history
+  if (path === "/api/referrals/transactions" && method === "GET") {
+    try {
+      const transactions = await dbQuery("credit_transactions", { 
+        filter: `user_id=eq.${user.id}&order=created_at.desc`
+      });
+      return jsonResponse(transactions || [], 200, origin);
+    } catch (e) {
+      return jsonResponse({ error: e.message }, 500, origin);
+    }
+  }
+
+  // ================== WITHDRAWALS ==================
+  if (path === "/api/withdrawals/my" && method === "GET") {
+    try {
+      const unpaid = await dbQuery("platform_transactions", { select: 'owner_share', filter: `channel_owner_id=eq.${user.id}&owner_paid_out=eq.false` });
+      const pendingEarnings = (unpaid || []).reduce((sum: number, r: any) => sum + parseFloat(r.owner_share), 0);
+      const withdrawals = await dbQuery("withdrawals", { filter: `channel_owner_id=eq.${user.id}&order=request_date.desc` });
+      return jsonResponse({ pendingEarnings, withdrawals: withdrawals || [] }, 200, origin);
+    } catch (e) {
+      return jsonResponse({ error: e.message }, 500, origin);
+    }
+  }
+
+  if (path === "/api/withdrawals/request" && method === "POST") {
+    const { amount } = body;
+    if (!amount || amount <= 0) return jsonResponse({ error: "Invalid amount" }, 400, origin);
+    try {
+      const unpaid = await dbQuery("platform_transactions", { select: 'owner_share', filter: `channel_owner_id=eq.${user.id}&owner_paid_out=eq.false` });
+      const total = (unpaid || []).reduce((s: number, r: any) => s + parseFloat(r.owner_share), 0);
+      if (amount > total) return jsonResponse({ error: "Insufficient balance" }, 400, origin);
+      await dbQuery("withdrawals", { method: 'POST', body: { channel_owner_id: user.id, amount, status: "pending" } });
+      return jsonResponse({ success: true }, 200, origin);
+    } catch (e) {
+      return jsonResponse({ error: e.message }, 500, origin);
+    }
+  }
+
+  // ================== REVIEWS & REPORTS ==================
+  if (path === "/api/reviews" && method === "POST") {
+    const { channel_id, rating, comment } = body;
+    if (!channel_id || !rating || rating < 1 || rating > 5) return jsonResponse({ error: "Invalid rating" }, 400, origin);
+    try {
+      const existingReviews = await dbQuery("reviews", { filter: `user_id=eq.${user.id}&channel_id=eq.${channel_id}` });
+      if (existingReviews && existingReviews.length > 0) return jsonResponse({ error: "You have already rated this channel" }, 400, origin);
+      await dbQuery("reviews", { method: 'POST', body: { user_id: user.id, channel_id, rating, comment } });
+      return jsonResponse({ success: true }, 200, origin);
+    } catch (e) {
+      return jsonResponse({ error: e.message }, 500, origin);
+    }
+  }
+
+  if (path.match(/^\/api\/reviews\/check\/[a-f0-9-]+$/) && method === "GET") {
+    const channel_id = path.split("/").pop()!;
+    if (!isValidUUID(channel_id)) return jsonResponse({ error: "Invalid channel ID" }, 400, origin);
+    try {
+      const existingReviews = await dbQuery("reviews", { filter: `user_id=eq.${user.id}&channel_id=eq.${channel_id}` });
+      return jsonResponse({ alreadyRated: existingReviews && existingReviews.length > 0 }, 200, origin);
+    } catch (e) {
+      return jsonResponse({ error: e.message }, 500, origin);
+    }
+  }
+
+  if (path.match(/^\/api\/reviews\/[a-f0-9-]+$/) && method === "GET") {
+    const channel_id = path.split("/").pop()!;
+    if (!isValidUUID(channel_id)) return jsonResponse({ error: "Invalid channel ID" }, 400, origin);
+    try {
+      const reviews = await dbQuery("reviews", { filter: `channel_id=eq.${channel_id}&order=created_at.desc` });
+      return jsonResponse(reviews || [], 200, origin);
+    } catch (e) {
+      return jsonResponse({ error: e.message }, 500, origin);
+    }
+  }
+
+  if (path === "/api/reports" && method === "POST") {
+    const { channel_id, reason, description } = body;
+    try {
+      const existingReports = await dbQuery("reports", { filter: `reporter_id=eq.${user.id}&reported_channel_id=eq.${channel_id}` });
+      if (existingReports && existingReports.length > 0) return jsonResponse({ error: "You have already reported this channel" }, 400, origin);
+      await dbQuery("reports", { method: 'POST', body: { reporter_id: user.id, reported_channel_id: channel_id, reason, description } });
+      return jsonResponse({ success: true }, 200, origin);
+    } catch (e) {
+      return jsonResponse({ error: e.message }, 500, origin);
+    }
+  }
+
+  if (path.match(/^\/api\/reports\/check\/[a-f0-9-]+$/) && method === "GET") {
+    const channel_id = path.split("/").pop()!;
+    if (!isValidUUID(channel_id)) return jsonResponse({ error: "Invalid channel ID" }, 400, origin);
+    try {
+      const existingReports = await dbQuery("reports", { filter: `reporter_id=eq.${user.id}&reported_channel_id=eq.${channel_id}` });
+      return jsonResponse({ alreadyReported: existingReports && existingReports.length > 0 }, 200, origin);
+    } catch (e) {
+      return jsonResponse({ error: e.message }, 500, origin);
+    }
+  }
+
+  // ================== ADMIN ==================
+  if (user && user.id.toString() === ADMIN_TELEGRAM_ID) {
+    if (path === "/api/admin/reports" && method === "GET") {
+      try {
+        const reports = await dbQuery("reports", { filter: `order=created_at.desc` });
+        const enrichedReports = await Promise.all(
+          (reports || []).map(async (report: any) => {
+            try {
+              const reporters = await dbQuery("users", { select: 'telegram_id,first_name,username', filter: `telegram_id=eq.${report.reporter_id}` });
+              const channels = await dbQuery("channels", { select: 'id,channel_name,owner_id', filter: `id=eq.${report.reported_channel_id}` });
+              let channelOwner = { first_name: 'Unknown', username: 'unknown' };
+              if (channels[0]?.owner_id) {
+                const owners = await dbQuery("users", { select: 'telegram_id,first_name,username', filter: `telegram_id=eq.${channels[0].owner_id}` });
+                channelOwner = owners[0] || channelOwner;
+              }
+              return { ...report, reporter: reporters[0] || { first_name: 'Unknown' }, channel: channels[0] || { channel_name: 'Unknown' }, channel_owner: channelOwner };
+            } catch (e) {
+              return { ...report, reporter: { first_name: 'Error' }, channel: { channel_name: 'Error' }, channel_owner: { first_name: 'Error' } };
+            }
+          })
+        );
+        return jsonResponse(enrichedReports, 200, origin);
+      } catch (e) {
+        return jsonResponse({ error: e.message }, 500, origin);
+      }
+    }
+
+    if (path.match(/^\/api\/admin\/reports\/[a-f0-9-]+\/review$/) && method === "POST") {
+      const reportId = path.split("/")[4];
+      const { action } = body;
+      if (!isValidUUID(reportId)) return jsonResponse({ error: "Invalid report ID" }, 400, origin);
+      if (!action || !['ban', 'dismiss'].includes(action)) return jsonResponse({ error: "Invalid action" }, 400, origin);
+      
+      try {
+        const reports = await dbQuery("reports", { filter: `id=eq.${reportId}` });
+        const report = reports[0];
+        if (!report) return jsonResponse({ error: "Report not found" }, 404, origin);
+        
+        if (action === 'dismiss') {
+          await dbQuery("reports", { method: 'DELETE', filter: `id=eq.${reportId}` });
+          return jsonResponse({ success: true, action: 'dismissed' }, 200, origin);
+        }
+        
+        if (action === 'ban') {
+          await dbQuery("reports", { method: 'PATCH', filter: `id=eq.${reportId}`, body: { status: 'banned', reviewed_by: user.id, reviewed_at: new Date().toISOString() } });
+          await dbQuery("channels", { method: 'PATCH', filter: `id=eq.${report.reported_channel_id}`, body: { is_active: false } });
+          return jsonResponse({ success: true, action: 'banned' }, 200, origin);
+        }
+        
+        return jsonResponse({ error: "Invalid action" }, 400, origin);
+      } catch (e) {
+        return jsonResponse({ error: e.message }, 500, origin);
+      }
+    }
+
+    if (path === "/api/admin/withdrawals" && method === "GET") {
+      try {
+        const withdrawals = await dbQuery("withdrawals", { filter: `status=eq.pending&order=request_date.asc` });
+        return jsonResponse(withdrawals || [], 200, origin);
+      } catch (e) {
+        return jsonResponse({ error: e.message }, 500, origin);
+      }
+    }
+
+    if (path.match(/^\/api\/admin\/withdrawals\/[a-f0-9-]+\/approve$/) && method === "POST") {
+      const withdrawalId = path.split("/")[4];
+      if (!isValidUUID(withdrawalId)) return jsonResponse({ error: "Invalid withdrawal ID" }, 400, origin);
+      try {
+        const withdrawals = await dbQuery("withdrawals", { filter: `id=eq.${withdrawalId}` });
+        const withdrawal = withdrawals[0];
+        if (!withdrawal || withdrawal.status !== 'pending') return jsonResponse({ error: "Withdrawal not found or already processed" }, 404, origin);
+        await dbQuery("withdrawals", { method: 'PATCH', filter: `id=eq.${withdrawalId}`, body: { status: 'processed', processed_date: new Date().toISOString(), processed_by: user.id } });
+        await dbQuery("platform_transactions", { method: 'PATCH', filter: `channel_owner_id=eq.${withdrawal.channel_owner_id}&owner_paid_out=eq.false`, body: { owner_paid_out: true } });
+        return jsonResponse({ success: true }, 200, origin);
+      } catch (e) {
+        return jsonResponse({ error: e.message }, 500, origin);
+      }
+    }
+
+    // Verification requests
+    if (path === "/api/admin/verifications" && method === "GET") {
+      try {
+        const requests = await dbQuery("verification_requests", { filter: `status=eq.pending&order=created_at.asc` });
+        return jsonResponse(requests || [], 200, origin);
+      } catch (e) {
+        return jsonResponse({ error: e.message }, 500, origin);
+      }
+    }
+
+    if (path.match(/^\/api\/admin\/verifications\/[a-f0-9-]+\/review$/) && method === "POST") {
+      const requestId = path.split("/")[4];
+      const { action, notes } = body;
+      if (!isValidUUID(requestId)) return jsonResponse({ error: "Invalid request ID" }, 400, origin);
+      
+      try {
+        const requests = await dbQuery("verification_requests", { filter: `id=eq.${requestId}` });
+        const request = requests[0];
+        if (!request || request.status !== 'pending') return jsonResponse({ error: "Request not found or already processed" }, 404, origin);
+        
+        await dbQuery("verification_requests", {
+          method: 'PATCH', filter: `id=eq.${requestId}`,
+          body: { status: action === 'approve' ? 'approved' : 'rejected', reviewed_by: user.id, reviewed_at: new Date().toISOString(), admin_notes: notes }
+        });
+        
+        if (action === 'approve') {
+          await dbQuery("channels", { method: 'PATCH', filter: `id=eq.${request.channel_id}`, body: { is_verified: true, verified_at: new Date().toISOString() } });
+        }
+        
+        return jsonResponse({ success: true }, 200, origin);
+      } catch (e) {
+        return jsonResponse({ error: e.message }, 500, origin);
+      }
+    }
+  }
+
+  return jsonResponse({ error: "Not found" }, 404, origin);
+}
+
+// ================== MAIN SERVE ==================
+serve(async (req: Request) => {
+  const url = new URL(req.url);
+  const path = url.pathname;
+  const method = req.method;
+  const origin = req.headers.get("Origin");
+
+  if (method === "OPTIONS") return new Response(null, { headers: getCorsHeaders(origin) });
+
+  if (path.endsWith("/bot-webhook") && method === "POST") {
+    if (!verifyWebhookSecret(req.headers)) return new Response("Unauthorized", { status: 401, headers: getCorsHeaders(origin) });
+    try {
+      const body = await req.json();
+      await handleBotUpdate(body);
+      return new Response("OK", { headers: getCorsHeaders(origin) });
+    } catch (e) {
+      console.error("Bot webhook error:", e);
+      return new Response("Error", { status: 500, headers: getCorsHeaders(origin) });
+    }
+  }
+
+  if (path.includes("/api/")) {
+    try {
+      const apiPath = path.substring(path.indexOf("/api/"));
+      let body = {};
+      if (method === "POST" || method === "PUT") {
+        try { body = await req.json(); } catch {}
+      }
+      return await apiHandler(apiPath, method, req.headers, body, origin);
+    } catch (e) {
+      console.error("API error:", e);
+      return jsonResponse({ error: "Internal server error" }, 500, origin);
+    }
+  }
+
+  return new Response("TON Subscription Bot API v2", { headers: getCorsHeaders(origin) });
+});
