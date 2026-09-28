@@ -1,7 +1,3 @@
---- COMPLETE_BACKEND.ts (原始)
-
-
-+++ COMPLETE_BACKEND.ts (修改后)
 // MySubHub Backend v2.2 - COMPLETE WITH ALL FIXES
 // Deploy this to your Supabase Edge Function
 // Replace your current file.txt with this entire content
