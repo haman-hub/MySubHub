@@ -14,7 +14,7 @@ const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET");
 const WEBAPP_URL = Deno.env.get("WEBAPP_URL") || "https://haman-hub.github.io/MySubHub-frontend";
 const TON_NETWORK = Deno.env.get("TON_NETWORK") || "mainnet";
 
-console.log(`🚀 Starting MySubHub Backend v2.2`);
+console.log(`🚀 Starting MySubHub Backend v2.3`);
 console.log(`📡 TON_NETWORK: ${TON_NETWORK}`);
 
 if (!BOT_TOKEN || !ADMIN_TELEGRAM_ID || !ADMIN_TON_WALLET) {
@@ -240,7 +240,62 @@ async function verifyTonPayment(walletAddress: string, expectedAmountNano: bigin
     return { success: false, error: `Verification error: ${e instanceof Error ? e.message : 'Unknown'}` };
   }
 }
-
+// ================== SUBSCRIPTION EXPIRATION (NEW v2.3) ==================
+async function expireSubscription(subId: string) {
+  try {
+    const subs = await dbSelect("subscriptions", { id: subId });
+    if (subs.length === 0) return { success: false, error: "Subscription not found" };
+    
+    const sub = subs[0];
+    const userId = sub.user_id as number;
+    const channelId = sub.channel_id as string;
+    
+    const channels = await dbSelect("channels", { id: channelId });
+    if (channels.length === 0) return { success: false, error: "Channel not found" };
+    
+    const channel = channels[0];
+    const channelChatId = channel.channel_chat_id as number;
+    
+    // Mark as expired
+    await dbUpdate("subscriptions", { id: subId }, { 
+      status: 'expired',
+      updated_at: new Date().toISOString()
+    });
+    
+    // Remove user from channel
+    if (channelChatId) {
+      try {
+        await telegramApi("banChatMember", {
+          chat_id: channelChatId,
+          user_id: userId,
+          revoke_messages: false
+        });
+        console.log(`✅ User ${userId} removed from channel ${channelChatId}`);
+      } catch (e) {
+        console.error(`❌ Failed to remove user:`, e);
+      }
+    }
+    
+    // Notify user
+    try {
+      await telegramApi("sendMessage", {
+        chat_id: userId,
+        text: `⚠️ Your subscription to "${escapeHtml(channel.channel_name as string)}" has expired.\n\nRenew it from the app!`,
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "🔄 Renew", web_app: { url: `${WEBAPP_URL}?startapp=${channelId}` } }
+          ]]
+        }
+      });
+    } catch (e) {
+      console.error("Failed to notify user:", e);
+    }
+    
+    return { success: true, userId, channelId };
+  } catch (e: unknown) {
+    return { success: false, error: e instanceof Error ? e.message : 'Unknown' };
+  }
+}
 // ================== BOT WEBHOOK HANDLER (FIXED - commands outside /start) ==================
 async function handleBotUpdate(body: Record<string, unknown>) {
   console.log("📩 Webhook received");
@@ -580,19 +635,24 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
 
   // ================== SUBSCRIPTIONS ==================
   if (path === "/api/subscriptions/my" && method === "GET") {
-    try {
-      const subs = await dbSelect("subscriptions", { user_id: telegramId });
-      const enriched = await Promise.all(subs.map(async (sub: Record<string, unknown>) => {
-        try {
-          const channels = await dbSelect("channels", { id: sub.channel_id as string });
-          return { ...sub, channel: channels[0] || null };
-        } catch { return { ...sub, channel: null }; }
-      }));
-      return jsonResponse(enriched, 200, origin);
-    } catch (e: unknown) {
-      return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
-    }
+  try {
+    const subs = await dbSelect("subscriptions", { user_id: telegramId });
+    const enriched = await Promise.all(subs.map(async (sub: Record<string, unknown>) => {
+      try {
+        const channels = await dbSelect("channels", { id: sub.channel_id as string });
+        const isExpired = sub.status === 'expired' || new Date(sub.end_date as string) < new Date();
+        return { 
+          ...sub, 
+          channel: channels[0] || null,
+          is_expired: isExpired
+        };
+      } catch { return { ...sub, channel: null, is_expired: false }; }
+    }));
+    return jsonResponse(enriched, 200, origin);
+  } catch (e: unknown) {
+    return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
   }
+}
 
   if (path === "/api/subscriptions/initiate" && method === "POST") {
     const { channel_id, credits_used = 0 } = body;
@@ -602,11 +662,16 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       if (channels.length === 0) return jsonResponse({ error: "Channel not found" }, 404, origin);
       const channel = channels[0];
 
-      const existing = await dbSelect("subscriptions", { user_id: telegramId, channel_id: channel_id as string, status: 'active' });
-      if (existing.length > 0) {
-        const endDate = new Date(existing[0].end_date as string);
-        if (endDate > new Date()) return jsonResponse({ error: "Already subscribed" }, 400, origin);
-      }
+const existing = await dbSelect("subscriptions", { user_id: telegramId, channel_id: channel_id as string });
+
+if (existing.length > 0) {
+  const latestSub = existing.sort((a, b) => new Date(b.created_at as string).getTime() - new Date(a.created_at as string).getTime())[0];
+  const endDate = new Date(latestSub.end_date as string);
+  
+  if (latestSub.status === 'active' && endDate > new Date()) {
+    return jsonResponse({ error: "Already subscribed" }, 400, origin);
+  }
+}
 
       const totalPrice = parseFloat(channel.subscription_price as string);
       const creditsAmount = parseFloat(credits_used as string) || 0;
@@ -705,6 +770,18 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
 
       if (nonce) {
         await dbUpdate("payment_nonces", { nonce: nonce as string }, { used: true }).catch(() => {});
+        // Unban user from channel (in case they were removed) - NEW v2.3
+if (channel.channel_chat_id) {
+  try {
+    await telegramApi("unbanChatMember", {
+      chat_id: channel.channel_chat_id,
+      user_id: telegramId,
+      only_if_banned: true
+    });
+  } catch (e) {
+    console.error("Failed to unban user:", e);
+  }
+}
       }
 
       return jsonResponse({ success: true, subscription: subResult?.[0], end_date: endDate.toISOString() }, 200, origin);
@@ -896,7 +973,36 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
   }
-
+  // ================== CRON: EXPIRE SUBSCRIPTIONS (NEW v2.3) ==================
+if (path === "/api/cron/expire-subscriptions" && method === "POST") {
+  if (!isAdmin && !body.internal) {
+    return jsonResponse({ error: "Unauthorized" }, 403, origin);
+  }
+  
+  try {
+    const now = new Date().toISOString();
+    const {  expiredSubs, error } = await supabase
+      .from('subscriptions')
+      .select('id')
+      .eq('status', 'active')
+      .lt('end_date', now);
+    
+    if (error) throw error;
+    if (!expiredSubs || expiredSubs.length === 0) {
+      return jsonResponse({ success: true, expired: 0 }, 200, origin);
+    }
+    
+    let expiredCount = 0;
+    for (const sub of expiredSubs) {
+      const result = await expireSubscription(sub.id);
+      if (result.success) expiredCount++;
+    }
+    
+    return jsonResponse({ success: true, expired: expiredCount }, 200, origin);
+  } catch (e: unknown) {
+    return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
+  }
+}
   return jsonResponse({ error: "Not found" }, 404, origin);
 }
 
@@ -925,7 +1031,7 @@ serve(async (req: Request) => {
 
       return jsonResponse({
         status: 'healthy',
-        version: '2.2.0',
+        version: '2.3.0',
         timestamp: new Date().toISOString(),
         network: TON_NETWORK,
         bot: botStatus,
@@ -982,7 +1088,7 @@ serve(async (req: Request) => {
     }
   }
 
-  return new Response("MySubHub API v2.2", { headers: getCorsHeaders(origin) });
+  return new Response("MySubHub API v2.3", { headers: getCorsHeaders(origin) });
 });
 
 // ================== AUTO-SETUP ==================
@@ -1016,4 +1122,4 @@ async function autoSetup() {
 }
 
 autoSetup();
-console.log("✅ MySubHub Backend v2.2 started");
+console.log("✅ MySubHub Backend v2.3 started");
