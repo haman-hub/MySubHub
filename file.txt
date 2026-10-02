@@ -11,7 +11,7 @@ const ADMIN_TON_WALLET = Deno.env.get("ADMIN_TON_WALLET");
 const TONCENTER_API_KEY = Deno.env.get("TONCENTER_API_KEY");
 const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET");
 const WEBAPP_URL = Deno.env.get("WEBAPP_URL") || "https://haman-hub.github.io/MySubHub-frontend";
-const TON_NETWORK = Deno.env.get("TON_NETWORK") || "testnet";
+const TON_NETWORK = Deno.env.get("TON_NETWORK") || "mainnet";
 const REFERRAL_CREDIT_PERCENT = 0.10; // 10% referral credit (NEW v2.4)
 
 console.log(`🚀 Starting MySubHub Backend v2.4`);
@@ -238,6 +238,56 @@ async function verifyTonPayment(walletAddress: string, expectedAmountNano: bigin
     return { success: false, error: "No matching transaction found" };
   } catch (e: unknown) {
     return { success: false, error: `Verification error: ${e instanceof Error ? e.message : 'Unknown'}` };
+  }
+}
+
+// ================== BOT ADMIN VERIFICATION ==================
+async function verifyBotIsAdmin(channelInviteLink: string): Promise<{ success: boolean; error?: string }> {
+  try {
+    // Extract channel username or ID from invite link
+    // Format: https://t.me/+abc123 or https://t.me/channelname
+    const match = channelInviteLink.match(/t\.me\/\+?([a-zA-Z0-9_]+)/);
+    if (!match) {
+      return { success: false, error: "Invalid invite link format" };
+    }
+    
+    const channelIdentifier = match[1];
+    
+    // Try to get chat info
+    const chatInfo = await telegramApi("getChat", { chat_id: channelIdentifier });
+    
+    if (!chatInfo.ok) {
+      return { success: false, error: "Could not access channel. Make sure the invite link is correct and the bot can access it." };
+    }
+    
+    const chatId = chatInfo.result.id;
+    
+    // Check if bot is admin in the channel
+    const botMember = await telegramApi("getChatMember", { 
+      chat_id: chatId, 
+      user_id: (await telegramApi("getMe")).result.id 
+    });
+    
+    if (!botMember.ok) {
+      return { success: false, error: "Bot is not a member of this channel" };
+    }
+    
+    const status = botMember.result.status;
+    
+    // Check if bot is administrator
+    if (status !== "administrator" && status !== "creator") {
+      return { 
+        success: false, 
+        error: "Bot must be added as administrator to this channel first. Please add the bot as admin and try again." 
+      };
+    }
+    
+    return { success: true };
+  } catch (e: unknown) {
+    return { 
+      success: false, 
+      error: "Failed to verify bot admin status. Please ensure the bot has been added as administrator to your channel." 
+    };
   }
 }
 
@@ -677,11 +727,20 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       return jsonResponse({ error: "Invalid duration. Must be 7, 30, 90, 180, 365, or 9999 days" }, 400, origin);
     }
     try {
-            // Check if user already has 5 channels (maximum limit)
+      // Check if user already has 5 channels (maximum limit)
       const userChannels = await dbSelect("channels", { owner_id: telegramId });
       if (userChannels.length >= 5) {
         return jsonResponse({ error: "Maximum channel limit reached. You can only add up to 5 channels." }, 400, origin);
       }
+      
+      // NEW: Verify bot is admin in the channel
+      const botAdminCheck = await verifyBotIsAdmin(channel_invite_link);
+      if (!botAdminCheck.success) {
+        return jsonResponse({ 
+          error: botAdminCheck.error || "Bot must be added as administrator to this channel first." 
+        }, 400, origin);
+      }
+      
       const result = await dbInsert("channels", {
         owner_id: telegramId,
         channel_name,
@@ -1024,11 +1083,12 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
     if ((amount as number) < MIN_WITHDRAWAL) return jsonResponse({ error: `Minimum withdrawal is ${MIN_WITHDRAWAL} TON` }, 400, origin);
     if (!wallet_address) return jsonResponse({ error: "Wallet address required" }, 400, origin);
     try {
-            // Check if user already has a pending withdrawal
+      // Check if user already has a pending withdrawal
       const pendingWithdrawals = await dbSelect("withdrawals", { channel_owner_id: telegramId, status: "pending" });
       if (pendingWithdrawals.length > 0) {
         return jsonResponse({ error: "You already have a pending withdrawal request. Please wait for it to be processed." }, 400, origin);
       }
+      
       const unpaid = await dbSelect("platform_transactions", { channel_owner_id: telegramId, owner_paid_out: false });
       const total = unpaid.reduce((s: number, r: Record<string, unknown>) => s + parseFloat(r.owner_share as string || '0'), 0);
       if ((amount as number) > total) return jsonResponse({ error: "Insufficient balance" }, 400, origin);
