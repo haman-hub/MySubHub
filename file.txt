@@ -386,7 +386,10 @@ async function handleBotUpdate(body: Record<string, unknown>) {
         text: `📺 *Your Channels*\n\nManage your channels, set prices, and track earnings.`,
         parse_mode: "Markdown",
         reply_markup: {
-          inline_keyboard: [[{ text: "📺 Open My Channels", web_app: { url: `${WEBAPP_URL}?startapp=owner` } }]]
+          inline_keyboard: [
+            [{ text: "📺 Open My Channels", web_app: { url: `${WEBAPP_URL}?startapp=owner` } }],
+            [{ text: "📚 Help", callback_data: "help" }]
+          ]
         }
       });
       return;
@@ -398,7 +401,10 @@ async function handleBotUpdate(body: Record<string, unknown>) {
         text: `📋 *Your Subscriptions*\n\nView and manage your active subscriptions.`,
         parse_mode: "Markdown",
         reply_markup: {
-          inline_keyboard: [[{ text: "📋 View My Subscriptions", web_app: { url: `${WEBAPP_URL}?startapp=subscriptions` } }]]
+          inline_keyboard: [
+            [{ text: "📋 View My Subscriptions", web_app: { url: `${WEBAPP_URL}?startapp=subscriptions` } }],
+            [{ text: "📚 Help", callback_data: "help" }]
+          ]
         }
       });
       return;
@@ -429,7 +435,12 @@ async function handleBotUpdate(body: Record<string, unknown>) {
       await telegramApi("sendMessage", {
         chat_id: chatId,
         text: msgText,
-        reply_markup: { inline_keyboard: [[{ text: btnText, web_app: { url } }]] }
+        reply_markup: { 
+          inline_keyboard: [
+            [{ text: btnText, web_app: { url } }],
+            [{ text: "📚 Help", callback_data: "help" }]
+          ] 
+        }
       });
       return;
     }
@@ -485,7 +496,10 @@ async function handleBotUpdate(body: Record<string, unknown>) {
           text: `✅ *Bot Added Successfully!*\n\n📺 Channel: ${escapeHtml(chat.title as string)}\n🔗 Invite Link: ${inviteLink || 'Not available'}\n\n*Next Steps:*\n1️⃣ Set your subscription price in the dashboard\n2️⃣ Share your subscription link\n3️⃣ Start earning TON!\n\n💡 *Your Share Link:*\n\`${shareLink}\``,
           parse_mode: "Markdown",
           reply_markup: {
-            inline_keyboard: [[{ text: "⚙️ Configure Channel", web_app: { url: `${WEBAPP_URL}?startapp=owner` } }]]
+            inline_keyboard: [
+              [{ text: "⚙️ Configure Channel", web_app: { url: `${WEBAPP_URL}?startapp=owner` } }],
+              [{ text: "📚 Help", callback_data: "help" }]
+            ]
           }
         });
         
@@ -493,6 +507,36 @@ async function handleBotUpdate(body: Record<string, unknown>) {
       } catch (e) {
         console.error("Channel registration error:", e);
       }
+    }
+  }
+  
+  // Handle callback queries (for help button)
+  const callbackQuery = body.callback_query as Record<string, unknown> | undefined;
+  if (callbackQuery) {
+    const data = callbackQuery.data as string;
+    const from = callbackQuery.from as Record<string, unknown>;
+    const chatId = (callbackQuery.message as Record<string, unknown>)?.chat as Record<string, unknown>;
+    const messageId = (callbackQuery.message as Record<string, unknown>)?.message_id as number;
+    
+    if (data === "help") {
+      await telegramApi("sendMessage", {
+        chat_id: (chatId as any).id,
+        text: `📚 *Need Help?*\n\n*Quick Commands:*\n/start - Open dashboard\n/help - View tutorial\n/mychannels - Manage channels\n/mysubs - View subscriptions\n/setup - Check bot status\n\n*Features:*\n• Subscribe to premium channels\n• Earn 10% referral credits\n• Monetize your own channels\n• Rate and review channels\n\nTap below for detailed guide:`,
+        parse_mode: "Markdown",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "👤 Subscriber Guide", web_app: { url: `${WEBAPP_URL}?startapp=help-subscriber` } }],
+            [{ text: "📺 Owner Guide", web_app: { url: `${WEBAPP_URL}?startapp=help-owner` } }],
+            [{ text: "🚀 Open App", web_app: { url: WEBAPP_URL } }]
+          ]
+        }
+      });
+      
+      // Answer the callback to remove loading state
+      await telegramApi("answerCallbackQuery", {
+        callback_query_id: callbackQuery.id as string,
+        text: "Help information sent!"
+      });
     }
   }
 }
@@ -683,6 +727,33 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       const visibleReviews = reviews.filter((r: Record<string, unknown>) => !r.is_hidden);
       
       return jsonResponse({ ...channel, reviews: visibleReviews }, 200, origin);
+    } catch (e: unknown) {
+      return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
+    }
+  }
+  
+  // DELETE channel endpoint
+  if (path.match(/^\/api\/channels\/[a-f0-9-]+$/) && method === "DELETE") {
+    const channelId = path.split("/")[3];
+    if (!isValidUUID(channelId)) return jsonResponse({ error: "Invalid channel ID" }, 400, origin);
+    try {
+      // Verify ownership
+      const channels = await dbSelect("channels", { id: channelId, owner_id: telegramId });
+      if (channels.length === 0) return jsonResponse({ error: "Channel not found or unauthorized" }, 404, origin);
+      
+      const channel = channels[0];
+      
+      // Delete related data
+      await dbDelete("subscriptions", { channel_id: channelId });
+      await dbDelete("reviews", { channel_id: channelId });
+      await dbDelete("reports", { reported_channel_id: channelId });
+      await dbDelete("platform_transactions", { channel_id: channelId });
+      
+      // Delete the channel
+      await dbDelete("channels", { id: channelId });
+      
+      console.log(`✅ Channel ${channelId} deleted by user ${telegramId}`);
+      return jsonResponse({ success: true, message: "Channel deleted successfully" }, 200, origin);
     } catch (e: unknown) {
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
