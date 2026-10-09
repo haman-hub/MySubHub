@@ -11,7 +11,7 @@ const ADMIN_TON_WALLET = Deno.env.get("ADMIN_TON_WALLET");
 const TONCENTER_API_KEY = Deno.env.get("TONCENTER_API_KEY");
 const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET");
 const WEBAPP_URL = Deno.env.get("WEBAPP_URL") || "https://haman-hub.github.io/MySubHub-frontend";
-const TON_NETWORK = Deno.env.get("TON_NETWORK") || "mainnet";
+const TON_NETWORK = Deno.env.get("TON_NETWORK") || "testnet";
 const REFERRAL_CREDIT_PERCENT = 0.10; // 10% referral credit (NEW v2.4)
 
 console.log(`🚀 Starting MySubHub Backend v2.4`);
@@ -759,15 +759,49 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
     const channelId = path.split("/")[3];
     if (!isValidUUID(channelId)) return jsonResponse({ error: "Invalid channel ID" }, 400, origin);
     const { subscription_price, duration_days } = body;
+    
+    console.log('📝 PUT /api/channels/:id - Received update request:', { channelId, subscription_price, duration_days });
+    
     try {
       const channels = await dbSelect("channels", { id: channelId, owner_id: telegramId });
       if (channels.length === 0) return jsonResponse({ error: "Channel not found" }, 404, origin);
+      
       const updateBody: Record<string, unknown> = { updated_at: new Date().toISOString() };
-      if (subscription_price && (subscription_price as number) > 0) updateBody.subscription_price = subscription_price;
-      if (duration_days && (duration_days as number) > 0) updateBody.duration_days = duration_days;
+      
+      // Parse and validate price - be more lenient
+      if (subscription_price !== undefined && subscription_price !== null) {
+        const parsedPrice = parseFloat(String(subscription_price));
+        console.log('🔍 Parsed price:', { original: subscription_price, parsed: parsedPrice, isNaN: isNaN(parsedPrice) });
+        
+        if (!isNaN(parsedPrice) && parsedPrice >= 0) {
+          updateBody.subscription_price = parsedPrice;
+          console.log('✅ Price will be updated to:', parsedPrice);
+        } else {
+          console.warn('⚠️ Invalid price, skipping update');
+        }
+      }
+      
+      // Parse and validate duration
+      if (duration_days !== undefined && duration_days !== null) {
+        const parsedDuration = parseInt(String(duration_days));
+        console.log('🔍 Parsed duration:', { original: duration_days, parsed: parsedDuration, isNaN: isNaN(parsedDuration) });
+        
+        if (!isNaN(parsedDuration) && parsedDuration > 0) {
+          updateBody.duration_days = parsedDuration;
+          console.log('✅ Duration will be updated to:', parsedDuration);
+        } else {
+          console.warn('⚠️ Invalid duration, skipping update');
+        }
+      }
+      
+      console.log('📤 Update body being sent to database:', updateBody);
+      
       const result = await dbUpdate("channels", { id: channelId }, updateBody);
+      console.log('✅ Database update result:', result);
+      
       return jsonResponse(result?.[0] || { success: true }, 200, origin);
     } catch (e: unknown) {
+      console.error('❌ Error updating channel:', e);
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
   }
