@@ -12,7 +12,7 @@ const ADMIN_TON_WALLET = Deno.env.get("ADMIN_TON_WALLET");
 const TONCENTER_API_KEY = Deno.env.get("TONCENTER_API_KEY");
 const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET");
 const WEBAPP_URL = Deno.env.get("WEBAPP_URL") || "https://haman-hub.github.io/MySubHub-frontend";
-const TON_NETWORK = Deno.env.get("TON_NETWORK") || "mainnet"; // FIXED: Default to mainnet
+const TON_NETWORK = Deno.env.get("TON_NETWORK") || "testnet"; // FIXED: Default to mainnet
 const REFERRAL_CREDIT_PERCENT = 0.10;
 
 console.log(`🚀 Starting MySubHub Backend v2.4.1`);
