@@ -1,5 +1,6 @@
-// MySubHub Backend v2.4.1 - COMPLETE WITH ALL FIXES
-// Fixed: Edit channel price, admin channels tab visibility, forward button, expiration cron
+// MySubHub Backend v2.5.0 - ESCROW PAYMENT SYSTEM
+// All payments go to ADMIN_TON_WALLET first, then distributed to channel owners
+// Platform fee (1%) is collected automatically
 // Deploy this to Supabase Edge Functions
 
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
@@ -8,15 +9,16 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 // ================== CONFIG ==================
 const BOT_TOKEN = Deno.env.get("BOT_TOKEN");
 const ADMIN_TELEGRAM_ID = Deno.env.get("ADMIN_TELEGRAM_ID");
-const ADMIN_TON_WALLET = Deno.env.get("ADMIN_TON_WALLET");
+const ADMIN_TON_WALLET = Deno.env.get("ADMIN_TON_WALLET"); // ESCROW: All payments go here
 const TONCENTER_API_KEY = Deno.env.get("TONCENTER_API_KEY");
 const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET");
 const WEBAPP_URL = Deno.env.get("WEBAPP_URL") || "https://haman-hub.github.io/MySubHub-frontend";
-const TON_NETWORK = Deno.env.get("TON_NETWORK") || "mainnet"; // FIXED: Default to mainnet
+const TON_NETWORK = Deno.env.get("TON_NETWORK") || "mainnet";
 const REFERRAL_CREDIT_PERCENT = 0.10;
 
-console.log(`🚀 Starting MySubHub Backend v2.4.1`);
+console.log(`🚀 Starting MySubHub Backend v2.5.0 - ESCROW SYSTEM`);
 console.log(`📡 TON_NETWORK: ${TON_NETWORK}`);
+console.log(`💰 ESCROW: All payments go to ADMIN_TON_WALLET`);
 
 if (!BOT_TOKEN || !ADMIN_TELEGRAM_ID || !ADMIN_TON_WALLET) {
   console.error("❌ Missing required environment variables");
@@ -30,7 +32,7 @@ const TONCENTER_BASE = TON_NETWORK === "testnet"
   : "https://toncenter.com/api/v2";
 
 const NETWORK_FEE_NANO = 50_000_000n;
-const PLATFORM_FEE_PERCENT = 0.01;
+const PLATFORM_FEE_PERCENT = 0.01; // 1% platform fee
 const MIN_WITHDRAWAL = 1.0;
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
@@ -249,38 +251,38 @@ async function verifyBotIsAdmin(channelInviteLink: string): Promise<{ success: b
     if (!match) {
       return { success: false, error: "Invalid invite link format" };
     }
-    
+
     const channelIdentifier = match[1];
     const chatInfo = await telegramApi("getChat", { chat_id: channelIdentifier });
-    
+
     if (!chatInfo.ok) {
       return { success: false, error: "Could not access channel. Make sure the invite link is correct and the bot can access it." };
     }
-    
+
     const chatId = chatInfo.result.id;
-    const botMember = await telegramApi("getChatMember", { 
-      chat_id: chatId, 
-      user_id: (await telegramApi("getMe")).result.id 
+    const botMember = await telegramApi("getChatMember", {
+      chat_id: chatId,
+      user_id: (await telegramApi("getMe")).result.id
     });
-    
+
     if (!botMember.ok) {
       return { success: false, error: "Bot is not a member of this channel" };
     }
-    
+
     const status = botMember.result.status;
-    
+
     if (status !== "administrator" && status !== "creator") {
-      return { 
-        success: false, 
-        error: "Bot must be added as administrator to this channel first. Please add the bot as admin and try again." 
+      return {
+        success: false,
+        error: "Bot must be added as administrator to this channel first. Please add the bot as admin and try again."
       };
     }
-    
+
     return { success: true };
   } catch (e: unknown) {
-    return { 
-      success: false, 
-      error: "Failed to verify bot admin status. Please ensure the bot has been added as administrator to your channel." 
+    return {
+      success: false,
+      error: "Failed to verify bot admin status. Please ensure the bot has been added as administrator to your channel."
     };
   }
 }
@@ -290,22 +292,22 @@ async function expireSubscription(subId: string) {
   try {
     const subs = await dbSelect("subscriptions", { id: subId });
     if (subs.length === 0) return { success: false, error: "Subscription not found" };
-    
+
     const sub = subs[0];
     const userId = sub.user_id as number;
     const channelId = sub.channel_id as string;
-    
+
     const channels = await dbSelect("channels", { id: channelId });
     if (channels.length === 0) return { success: false, error: "Channel not found" };
-    
+
     const channel = channels[0];
     const channelChatId = channel.channel_chat_id as number;
-    
-    await dbUpdate("subscriptions", { id: subId }, { 
+
+    await dbUpdate("subscriptions", { id: subId }, {
       status: 'expired',
       updated_at: new Date().toISOString()
     });
-    
+
     if (channelChatId) {
       try {
         await telegramApi("banChatMember", {
@@ -318,7 +320,7 @@ async function expireSubscription(subId: string) {
         console.error(`❌ Failed to remove user:`, e);
       }
     }
-    
+
     try {
       await telegramApi("sendMessage", {
         chat_id: userId,
@@ -332,7 +334,7 @@ async function expireSubscription(subId: string) {
     } catch (e) {
       console.error("Failed to notify user:", e);
     }
-    
+
     return { success: true, userId, channelId };
   } catch (e: unknown) {
     return { success: false, error: e instanceof Error ? e.message : 'Unknown' };
@@ -343,15 +345,15 @@ async function expireSubscription(subId: string) {
 async function handleBotUpdate(body: Record<string, unknown>) {
   console.log("📩 Webhook received");
   const message = body.message as Record<string, unknown> | undefined;
-  
+
   if (message?.text) {
     const chatId = (message.chat as Record<string, unknown>).id as number;
     const from = message.from as Record<string, unknown>;
     const telegramId = from.id as number;
     const text = message.text as string;
-    
+
     console.log(`📩 Message: ${text} from ${telegramId}`);
-    
+
     try {
       const existing = await dbSelect("users", { telegram_id: telegramId });
       if (existing.length === 0) {
@@ -374,11 +376,11 @@ async function handleBotUpdate(body: Record<string, unknown>) {
     } catch (e) {
       console.error("User upsert error:", e);
     }
-    
+
     if (text.startsWith("/setup")) {
       const checks: string[] = [];
       checks.push(BOT_TOKEN ? "✅ Bot Token: Configured" : "❌ Bot Token: Missing");
-      
+
       try {
         const webhookInfo = await telegramApi("getWebhookInfo");
         if (webhookInfo.ok) {
@@ -391,14 +393,14 @@ async function handleBotUpdate(body: Record<string, unknown>) {
       } catch {
         checks.push("❌ Webhook: Error checking");
       }
-      
+
       try {
         const { error } = await supabase.from('users').select('telegram_id').limit(1);
         checks.push(error ? "❌ Database: Connection failed" : "✅ Database: Connected");
       } catch {
         checks.push("❌ Database: Error");
       }
-      
+
       await telegramApi("sendMessage", {
         chat_id: chatId,
         text: `🔧 *Bot Setup Check*\n\n${checks.join('\n')}\n\n*Important:*\n• Bot privacy must be DISABLED in @BotFather\n• Use /setprivacy → DISABLED`,
@@ -406,7 +408,7 @@ async function handleBotUpdate(body: Record<string, unknown>) {
       });
       return;
     }
-    
+
     if (text.startsWith("/help")) {
       await telegramApi("sendMessage", {
         chat_id: chatId,
@@ -422,7 +424,7 @@ async function handleBotUpdate(body: Record<string, unknown>) {
       });
       return;
     }
-    
+
     if (text.startsWith("/mychannels")) {
       await telegramApi("sendMessage", {
         chat_id: chatId,
@@ -434,7 +436,7 @@ async function handleBotUpdate(body: Record<string, unknown>) {
       });
       return;
     }
-    
+
     if (text.startsWith("/mysubs")) {
       await telegramApi("sendMessage", {
         chat_id: chatId,
@@ -446,17 +448,17 @@ async function handleBotUpdate(body: Record<string, unknown>) {
       });
       return;
     }
-    
+
     if (text.startsWith("/start")) {
       const parts = text.replace(/^\/start(?:@\w+)?\s*/, "").trim();
       let url = WEBAPP_URL;
       let msgText = `Welcome, ${escapeHtml(from.first_name as string || 'User')}! 🎉`;
       let btnText = "🚀 Open Dashboard";
-      
+
       if (parts === "owner") { url += "?startapp=owner"; btnText = "📺 My Channels"; }
       else if (parts.startsWith("ref_")) { url += "?startapp=referral"; }
       else if (parts && isValidUUID(parts)) { url += `?startapp=${parts}`; msgText = "Subscribe to this channel:"; btnText = "💎 Subscribe"; }
-      
+
       await telegramApi("sendMessage", {
         chat_id: chatId,
         text: msgText,
@@ -465,7 +467,7 @@ async function handleBotUpdate(body: Record<string, unknown>) {
       return;
     }
   }
-  
+
   const myChatMember = body.my_chat_member as Record<string, unknown> | undefined;
   if (myChatMember) {
     const chat = myChatMember.chat as Record<string, unknown>;
@@ -473,20 +475,20 @@ async function handleBotUpdate(body: Record<string, unknown>) {
     const from = myChatMember.from as Record<string, unknown>;
     const chatId = chat.id as number;
     const chatType = chat.type as string;
-    
+
     console.log(`📡 my_chat_member: ${chat.title}(${chatId}), status=${newStatus}`);
-    
+
     if (newStatus === "administrator" && ["channel", "group", "supergroup"].includes(chatType)) {
       let inviteLink = "";
       try {
         const res = await telegramApi("exportChatInviteLink", { chat_id: chatId });
         if (res.ok) inviteLink = res.result as string;
       } catch {}
-      
+
       try {
         const existing = await dbSelect("channels", { channel_chat_id: chatId });
         let channelId: string;
-        
+
         if (existing.length === 0) {
           const result = await dbInsert("channels", {
             owner_id: from.id,
@@ -508,9 +510,9 @@ async function handleBotUpdate(body: Record<string, unknown>) {
           });
           channelId = existing[0].id as string;
         }
-        
+
         const shareLink = `https://t.me/${BOT_TOKEN?.split(':')[0]}?start=${channelId}`;
-        
+
         await telegramApi("sendMessage", {
           chat_id: from.id as number,
           text: `✅ *Bot Added Successfully!*\n\n📺 Channel: ${escapeHtml(chat.title as string)}\n🔗 Invite Link: ${inviteLink || 'Not available'}\n\n*Next Steps:*\n1️⃣ Set your subscription price in the dashboard\n2️⃣ Share your subscription link\n3️⃣ Start earning TON!\n\n💡 *Your Share Link:*\n\`${shareLink}\``,
@@ -519,7 +521,7 @@ async function handleBotUpdate(body: Record<string, unknown>) {
             inline_keyboard: [[{ text: "⚙️ Configure Channel", web_app: { url: `${WEBAPP_URL}?startapp=owner` } }]]
           }
         });
-        
+
         console.log(`✅ Channel registered: ${chat.title} (${channelId})`);
       } catch (e) {
         console.error("Channel registration error:", e);
@@ -532,13 +534,13 @@ async function handleBotUpdate(body: Record<string, unknown>) {
 async function apiHandler(path: string, method: string, headers: Headers, body: Record<string, unknown>, origin: string | null) {
   const initData = headers.get("x-telegram-initdata") || "";
   const tgUser = await validateInitData(initData);
-  
+
   if (!tgUser || !tgUser.id) {
     return jsonResponse({ error: "Unauthorized: Invalid Telegram data" }, 401, origin);
   }
-  
+
   const telegramId = tgUser.id as number;
-  
+
   let user: Record<string, unknown>;
   try {
     const users = await dbSelect("users", { telegram_id: telegramId });
@@ -560,18 +562,18 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
     console.error("User auth error:", e);
     return jsonResponse({ error: "Authentication failed" }, 500, origin);
   }
-  
+
   if (user.is_banned) {
     return jsonResponse({ error: "Account suspended" }, 403, origin);
   }
-  
+
   const userIdStr = telegramId.toString();
   if (!checkRateLimit(userIdStr)) {
     return jsonResponse({ error: "Too many requests" }, 429, origin);
   }
-  
+
   const isAdmin = userIdStr === ADMIN_TELEGRAM_ID;
-  
+
   if (path === "/api/auth/validate" && (method === "GET" || method === "POST")) {
     return jsonResponse({
       user: {
@@ -586,7 +588,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       isAdmin,
     }, 200, origin);
   }
-  
+
   if (path === "/api/auth/wallet" && method === "POST") {
     const { wallet_address } = body;
     if (!wallet_address || typeof wallet_address !== 'string') {
@@ -595,7 +597,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
     await dbUpdate("users", { telegram_id: telegramId }, { wallet_address });
     return jsonResponse({ success: true }, 200, origin);
   }
-  
+
   if (path === "/api/channels/my" && method === "GET") {
     try {
       const channels = await dbSelect("channels", { owner_id: telegramId });
@@ -621,7 +623,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
   }
-  
+
   if (path === "/api/admin/channels" && method === "GET") {
     if (!isAdmin) return jsonResponse({ error: "Not found" }, 404, origin);
     try {
@@ -650,7 +652,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
   }
-  
+
   if (path === "/api/channels/register" && method === "POST") {
     const { channel_name, channel_invite_link, subscription_price, duration_days } = body;
     if (!channel_name || !channel_invite_link) return jsonResponse({ error: "Name and invite link required" }, 400, origin);
@@ -664,14 +666,14 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       if (userChannels.length >= 5) {
         return jsonResponse({ error: "Maximum channel limit reached. You can only add up to 5 channels." }, 400, origin);
       }
-      
+
       const botAdminCheck = await verifyBotIsAdmin(channel_invite_link as string);
       if (!botAdminCheck.success) {
-        return jsonResponse({ 
-          error: botAdminCheck.error || "Bot must be added as administrator to this channel first." 
+        return jsonResponse({
+          error: botAdminCheck.error || "Bot must be added as administrator to this channel first."
         }, 400, origin);
       }
-      
+
       const result = await dbInsert("channels", {
         owner_id: telegramId,
         channel_name,
@@ -685,7 +687,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
   }
-  
+
   if (path.match(/^\/api\/channels\/[a-f0-9-]+$/) && method === "PUT") {
     const channelId = path.split("/")[3];
     if (!isValidUUID(channelId)) return jsonResponse({ error: "Invalid channel ID" }, 400, origin);
@@ -712,49 +714,49 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
   }
-  
+
   if (path.match(/^\/api\/channels\/[a-f0-9-]+$/) && method === "GET") {
     const channelId = path.split("/")[3];
     if (!isValidUUID(channelId)) return jsonResponse({ error: "Invalid channel ID" }, 400, origin);
     try {
       const channels = await dbSelect("channels", { id: channelId, is_active: true });
       if (channels.length === 0) return jsonResponse({ error: "Channel not found" }, 404, origin);
-      
+
       const channel = channels[0];
       const owners = await dbSelect("users", { telegram_id: channel.owner_id as number });
       if (owners.length > 0 && owners[0].is_banned) {
         return jsonResponse({ error: "This channel is unavailable" }, 403, origin);
       }
-      
+
       const reviews = await dbSelect("reviews", { channel_id: channelId });
       const visibleReviews = reviews.filter((r: Record<string, unknown>) => !r.is_hidden);
-      
+
       return jsonResponse({ ...channel, reviews: visibleReviews }, 200, origin);
     } catch (e: unknown) {
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
   }
-  
+
   if (path.match(/^\/api\/channels\/[a-f0-9-]+$/) && method === "DELETE") {
     const channelId = path.split("/")[3];
     if (!isValidUUID(channelId)) return jsonResponse({ error: "Invalid channel ID" }, 400, origin);
     try {
       const channels = await dbSelect("channels", { id: channelId, owner_id: telegramId });
       if (channels.length === 0) return jsonResponse({ error: "Channel not found or unauthorized" }, 404, origin);
-      
+
       await dbDelete("subscriptions", { channel_id: channelId });
       await dbDelete("reviews", { channel_id: channelId });
       await dbDelete("reports", { reported_channel_id: channelId });
       await dbDelete("platform_transactions", { channel_id: channelId });
       await dbDelete("channels", { id: channelId });
-      
+
       console.log(`✅ Channel ${channelId} deleted by user ${telegramId}`);
       return jsonResponse({ success: true, message: "Channel deleted successfully" }, 200, origin);
     } catch (e: unknown) {
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
   }
-  
+
   if (path === "/api/subscriptions/my" && method === "GET") {
     try {
       const subs = await dbSelect("subscriptions", { user_id: telegramId });
@@ -762,8 +764,8 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
         try {
           const channels = await dbSelect("channels", { id: sub.channel_id as string });
           const isExpired = sub.status === 'expired' || new Date(sub.end_date as string) < new Date();
-          return { 
-            ...sub, 
+          return {
+            ...sub,
             channel: channels[0] || null,
             is_expired: isExpired
           };
@@ -774,7 +776,8 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
   }
-  
+
+  // ================== ESCROW PAYMENT SYSTEM ==================
   if (path === "/api/subscriptions/initiate" && method === "POST") {
     const { channel_id, credits_used = 0 } = body;
     if (!channel_id || !isValidUUID(channel_id as string)) return jsonResponse({ error: "Invalid channel ID" }, 400, origin);
@@ -782,23 +785,24 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       const channels = await dbSelect("channels", { id: channel_id as string, is_active: true });
       if (channels.length === 0) return jsonResponse({ error: "Channel not found" }, 404, origin);
       const channel = channels[0];
-      
+
       const ownerUsers = await dbSelect("users", { telegram_id: channel.owner_id as number });
       if (ownerUsers.length > 0 && ownerUsers[0].is_banned) {
         return jsonResponse({ error: "This channel is unavailable" }, 403, origin);
       }
-      
+
       const existing = await dbSelect("subscriptions", { user_id: telegramId, channel_id: channel_id as string });
-      
+
       if (existing.length > 0) {
         const latestSub = existing.sort((a, b) => new Date(b.created_at as string).getTime() - new Date(a.created_at as string).getTime())[0];
         const endDate = new Date(latestSub.end_date as string);
-        
+
         if (latestSub.status === 'active' && endDate > new Date()) {
           return jsonResponse({ error: "Already subscribed" }, 400, origin);
         }
       }
-      
+
+      // ESCROW: Calculate total with platform fee
       const channelPrice = parseFloat(channel.subscription_price as string);
       const platformFee = channelPrice * PLATFORM_FEE_PERCENT; // 1% platform fee
       const totalPrice = channelPrice + platformFee; // Subscriber pays channel price + 1% fee
@@ -806,10 +810,10 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       const remaining = totalPrice - creditsAmount;
       const remainingNano = BigInt(Math.round(remaining * 1e9));
       const totalNano = remainingNano + NETWORK_FEE_NANO;
-      
-      // All payments go to admin wallet (escrow system)
+
+      // ESCROW: All payments go to ADMIN wallet
       if (!ADMIN_TON_WALLET) return jsonResponse({ error: "Platform wallet not configured" }, 500, origin);
-      
+
       const nonce = crypto.randomUUID();
       await dbInsert("payment_nonces", {
         user_id: telegramId,
@@ -817,18 +821,25 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
         nonce,
         expires_at: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
       });
-      
+
+      console.log(`💰 ESCROW: Subscriber will pay ${totalPrice} TON (${channelPrice} + ${platformFee} fee) to ADMIN wallet`);
+
       return jsonResponse({
-        paymentDetails: { wallet: ADMIN_TON_WALLET, amountNano: totalNano.toString(), amount: remaining.toFixed(9), comment: nonce },
-        subscriptionDetails: { 
-          channel_id: channel.id, 
-          channel_name: channel.channel_name, 
-          channel_price: channelPrice,
-          platform_fee: platformFee,
-          total_price: totalPrice,
-          credits_used: creditsAmount, 
-          remaining, 
-          duration_days: channel.duration_days 
+        paymentDetails: {
+          wallet: ADMIN_TON_WALLET, // ESCROW: Payment goes to admin
+          amountNano: totalNano.toString(),
+          amount: remaining.toFixed(9),
+          comment: nonce
+        },
+        subscriptionDetails: {
+          channel_id: channel.id,
+          channel_name: channel.channel_name,
+          channel_price: channelPrice, // What channel owner set
+          platform_fee: platformFee, // 1% platform fee
+          total_price: totalPrice, // What subscriber pays
+          credits_used: creditsAmount,
+          remaining,
+          duration_days: channel.duration_days
         },
         nonce,
       }, 200, origin);
@@ -836,7 +847,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
   }
-  
+
   if (path === "/api/subscriptions/confirm" && method === "POST") {
     const { channel_id, transaction_hash, credits_used = 0, nonce } = body;
     if (!channel_id || !isValidUUID(channel_id as string)) return jsonResponse({ error: "Invalid channel ID" }, 400, origin);
@@ -844,26 +855,27 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       const channels = await dbSelect("channels", { id: channel_id as string, is_active: true });
       if (channels.length === 0) return jsonResponse({ error: "Channel not found" }, 404, origin);
       const channel = channels[0];
-      
+
+      // ESCROW: Calculate total with platform fee
       const channelPrice = parseFloat(channel.subscription_price as string);
-      const platformFeeAmount = channelPrice * PLATFORM_FEE_PERCENT; // 1% platform fee
-      const totalPrice = channelPrice + platformFeeAmount; // Subscriber pays channel price + 1% fee
+      const platformFeeAmount = channelPrice * PLATFORM_FEE_PERCENT;
+      const totalPrice = channelPrice + platformFeeAmount;
       const creditsAmount = parseFloat(credits_used as string) || 0;
       const remaining = totalPrice - creditsAmount;
-      
+
       let txHash = transaction_hash as string | undefined;
       if (remaining > 0 && !txHash) {
-        // Verify payment at ADMIN wallet (escrow system)
+        // ESCROW: Verify payment at ADMIN wallet
         if (!ADMIN_TON_WALLET) return jsonResponse({ error: "Platform wallet not configured" }, 500, origin);
         const result = await verifyTonPayment(ADMIN_TON_WALLET, BigInt(Math.round(remaining * 1e9)), nonce as string);
         if (!result.success) return jsonResponse({ error: result.error }, 400, origin);
         txHash = result.txHash;
       }
       if (!txHash) return jsonResponse({ error: "No valid transaction" }, 400, origin);
-      
+
       const dup = await dbSelect("subscriptions", { transaction_hash: txHash });
       if (dup.length > 0) return jsonResponse({ error: "Transaction already processed" }, 409, origin);
-      
+
       if (creditsAmount > 0) {
         try {
           const success = await dbRpc('deduct_credits', { p_user_id: telegramId, p_amount: creditsAmount });
@@ -872,7 +884,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
           return jsonResponse({ error: "Credit deduction failed" }, 500, origin);
         }
       }
-      
+
       const endDate = new Date();
       endDate.setDate(endDate.getDate() + (channel.duration_days as number));
       const subResult = await dbInsert("subscriptions", {
@@ -884,12 +896,13 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
         status: 'active',
         credits_used: creditsAmount,
       });
-      
-      // Escrow system: Admin receives full payment, owes channel owner the channel price
-      // Platform fee (1%) is already collected by admin
-      // Owner share is the full channel price (to be paid out after withdrawal approval)
+
+      // ESCROW: Record transaction with correct splits
+      // Admin received totalPrice (channelPrice + platformFee)
+      // Admin keeps platformFee (1%)
+      // Admin owes channelPrice to channel owner (to be paid on withdrawal)
       const ownerShare = channelPrice; // Channel owner gets the full channel price
-      
+
       await dbInsert("platform_transactions", {
         subscription_id: subResult?.[0]?.id,
         user_id: telegramId,
@@ -901,15 +914,17 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
         network_fee: Number(NETWORK_FEE_NANO) / 1e9,
         transaction_hash: txHash,
       });
-      
+
+      console.log(`💰 ESCROW: Admin received ${totalPrice} TON, keeps ${platformFeeAmount} TON fee, owes ${ownerShare} TON to owner`);
+
       try {
         const referrerUsers = await dbSelect("users", { telegram_id: telegramId });
         const referrerId = referrerUsers[0]?.referred_by;
         if (referrerId) {
           // Referral credit is based on channel price (not including platform fee)
           const creditAmount = channelPrice * REFERRAL_CREDIT_PERCENT;
-          await dbRpc('add_credits', { 
-            p_user_id: referrerId, 
+          await dbRpc('add_credits', {
+            p_user_id: referrerId,
             p_amount: creditAmount,
             p_description: `Referral credit from subscription`,
             p_reference_id: subResult?.[0]?.id
@@ -919,11 +934,11 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       } catch (e) {
         console.error("Referral credit error:", e);
       }
-      
+
       if (nonce) {
         await dbUpdate("payment_nonces", { nonce: nonce as string }, { used: true }).catch(() => {});
       }
-      
+
       if (channel.channel_chat_id) {
         try {
           await telegramApi("unbanChatMember", {
@@ -935,19 +950,19 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
           console.error("Failed to unban user:", e);
         }
       }
-      
+
       return jsonResponse({ success: true, subscription: subResult?.[0], end_date: endDate.toISOString() }, 200, origin);
     } catch (e: unknown) {
       console.error("Confirm error:", e);
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
   }
-  
+
   if (path === "/api/cron/expire-subscriptions" && method === "POST") {
     if (!isAdmin && !body.internal) {
       return jsonResponse({ error: "Unauthorized" }, 403, origin);
     }
-    
+
     try {
       const now = new Date().toISOString();
       const { data: expiredSubs, error } = await supabase
@@ -955,24 +970,24 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
         .select('id')
         .eq('status', 'active')
         .lt('end_date', now);
-      
+
       if (error) throw error;
       if (!expiredSubs || expiredSubs.length === 0) {
         return jsonResponse({ success: true, expired: 0 }, 200, origin);
       }
-      
+
       let expiredCount = 0;
       for (const sub of expiredSubs) {
         const result = await expireSubscription(sub.id);
         if (result.success) expiredCount++;
       }
-      
+
       return jsonResponse({ success: true, expired: expiredCount }, 200, origin);
     } catch (e: unknown) {
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
   }
-  
+
   if (path === "/api/referrals/stats" && method === "GET") {
     try {
       if (!user.referral_code) {
@@ -980,7 +995,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
         await dbUpdate("users", { telegram_id: telegramId }, { referral_code: code });
         user.referral_code = code;
       }
-      
+
       const referralCode = user.referral_code as string;
       const stats = await dbSelect("referrals", { referrer_id: telegramId });
       const credits = await dbSelect("referral_credits", { user_id: telegramId });
@@ -988,7 +1003,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       const totalEarned = credits[0]?.total_earned || 0;
       const totalUsed = credits[0]?.total_used || 0;
       const totalCreditsEarned = stats.reduce((sum: number, r: Record<string, unknown>) => sum + parseFloat(r.credits_earned as string || '0'), 0);
-      
+
       return jsonResponse({
         referralCode,
         referralLink: `https://t.me/${BOT_TOKEN?.split(':')[0]}?start=ref_${referralCode}`,
@@ -1002,7 +1017,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
   }
-  
+
   if (path === "/api/withdrawals/my" && method === "GET") {
     try {
       const unpaid = await dbSelect("platform_transactions", { channel_owner_id: telegramId, owner_paid_out: false });
@@ -1013,7 +1028,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
   }
-  
+
   if (path === "/api/withdrawals/request" && method === "POST") {
     const { amount, wallet_address } = body;
     if (!amount || (amount as number) <= 0) return jsonResponse({ error: "Invalid amount" }, 400, origin);
@@ -1024,7 +1039,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       if (pendingWithdrawals.length > 0) {
         return jsonResponse({ error: "You already have a pending withdrawal request. Please wait for it to be processed." }, 400, origin);
       }
-      
+
       const unpaid = await dbSelect("platform_transactions", { channel_owner_id: telegramId, owner_paid_out: false });
       const total = unpaid.reduce((s: number, r: Record<string, unknown>) => s + parseFloat(r.owner_share as string || '0'), 0);
       if ((amount as number) > total) return jsonResponse({ error: "Insufficient balance" }, 400, origin);
@@ -1034,7 +1049,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
   }
-  
+
   if (path === "/api/reviews" && method === "POST") {
     const { channel_id, rating, comment } = body;
     if (!channel_id || !rating || (rating as number) < 1 || (rating as number) > 5) return jsonResponse({ error: "Invalid rating" }, 400, origin);
@@ -1047,7 +1062,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
   }
-  
+
   if (path.match(/^\/api\/reviews\/[a-f0-9-]+$/) && method === "GET") {
     const channelId = path.split("/").pop()!;
     if (!isValidUUID(channelId)) return jsonResponse({ error: "Invalid channel ID" }, 400, origin);
@@ -1058,7 +1073,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
   }
-  
+
   if (path === "/api/reports" && method === "POST") {
     const { channel_id, reason, description } = body;
     if (!channel_id || !reason) return jsonResponse({ error: "Channel and reason required" }, 400, origin);
@@ -1071,9 +1086,9 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
   }
-  
+
   if (!isAdmin) return jsonResponse({ error: "Not found" }, 404, origin);
-  
+
   if (path === "/api/admin/reports" && method === "GET") {
     try {
       const reports = await dbSelect("reports", {});
@@ -1094,7 +1109,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
   }
-  
+
   if (path.match(/^\/api\/admin\/reports\/[a-f0-9-]+\/review$/) && method === "POST") {
     const reportId = path.split("/")[4];
     const { action } = body;
@@ -1122,7 +1137,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
   }
-  
+
   if (path === "/api/admin/withdrawals" && method === "GET") {
     try {
       const withdrawals = await dbSelect("withdrawals", { status: 'pending' });
@@ -1131,7 +1146,8 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
   }
-  
+
+  // ESCROW: Withdrawal approval with transfer instructions
   if (path.match(/^\/api\/admin\/withdrawals\/[a-f0-9-]+\/approve$/) && method === "POST") {
     const withdrawalId = path.split("/")[4];
     if (!isValidUUID(withdrawalId)) return jsonResponse({ error: "Invalid withdrawal ID" }, 400, origin);
@@ -1139,7 +1155,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       const withdrawals = await dbSelect("withdrawals", { id: withdrawalId });
       const withdrawal = withdrawals[0];
       if (!withdrawal || withdrawal.status !== 'pending') return jsonResponse({ error: "Not found or processed" }, 404, origin);
-      
+
       const unpaidTxs = await dbSelect("platform_transactions", { channel_owner_id: withdrawal.channel_owner_id as number, owner_paid_out: false });
       let remaining = parseFloat(withdrawal.amount as string);
       const coveredIds: string[] = [];
@@ -1151,22 +1167,24 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       for (const txId of coveredIds) {
         await dbUpdate("platform_transactions", { id: txId }, { owner_paid_out: true, withdrawal_id: withdrawalId });
       }
-      
-      // Get owner's wallet address for the transfer
+
+      // ESCROW: Get owner's wallet for transfer instructions
       const ownerUsers = await dbSelect("users", { telegram_id: withdrawal.channel_owner_id as number });
       const ownerWallet = ownerUsers[0]?.wallet_address || withdrawal.wallet_address;
-      
-      await dbUpdate("withdrawals", { 
-        id: withdrawalId, 
-        status: 'processed', 
-        processed_date: new Date().toISOString(), 
+
+      await dbUpdate("withdrawals", {
+        id: withdrawalId,
+        status: 'processed',
+        processed_date: new Date().toISOString(),
         processed_by: telegramId,
-        payout_tx_hash: 'PENDING_MANUAL_TRANSFER' // Admin needs to manually send TON
+        payout_tx_hash: 'PENDING_MANUAL_TRANSFER' // Admin needs to manually send
       });
-      
-      // Return transfer instructions for admin
-      return jsonResponse({ 
-        success: true, 
+
+      console.log(`💰 ESCROW: Withdrawal approved. Admin must send ${withdrawal.amount} TON to ${ownerWallet}`);
+
+      // ESCROW: Return transfer instructions for admin
+      return jsonResponse({
+        success: true,
         covered: coveredIds.length,
         transfer_instructions: {
           from: ADMIN_TON_WALLET,
@@ -1179,7 +1197,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
   }
-  
+
   return jsonResponse({ error: "Not found" }, 404, origin);
 }
 
@@ -1189,14 +1207,14 @@ serve(async (req: Request) => {
   const path = url.pathname;
   const method = req.method;
   const origin = req.headers.get("Origin");
-  
+
   if (method === "OPTIONS") return new Response(null, { headers: getCorsHeaders(origin) });
-  
+
   if (path === "/health" || path === "/" || path.endsWith("/health") || path.endsWith("/mainbot")) {
     try {
       const { error } = await supabase.from('users').select('telegram_id').limit(1);
       if (error) throw error;
-      
+
       let botStatus = 'unknown';
       try {
         const botInfo = await telegramApi("getMe");
@@ -1204,20 +1222,21 @@ serve(async (req: Request) => {
       } catch (e) {
         botStatus = `❌ ${e instanceof Error ? e.message : 'Unknown error'}`;
       }
-      
-      return jsonResponse({ 
-        status: 'healthy', 
-        version: '2.4.1', 
-        timestamp: new Date().toISOString(), 
+
+      return jsonResponse({
+        status: 'healthy',
+        version: '2.5.0',
+        timestamp: new Date().toISOString(),
         network: TON_NETWORK,
         bot: botStatus,
-        webhook_secret_set: !!WEBHOOK_SECRET
+        webhook_secret_set: !!WEBHOOK_SECRET,
+        escrow_enabled: true
       }, 200, origin);
     } catch {
       return jsonResponse({ status: 'unhealthy', error: 'Database connection failed' }, 503, origin);
     }
   }
-  
+
   if (path.endsWith("/test-bot") && method === "GET") {
     const chatId = url.searchParams.get("chat_id");
     const message = url.searchParams.get("message") || "Test message";
@@ -1229,7 +1248,7 @@ serve(async (req: Request) => {
       return jsonResponse({ error: "Failed", details: error instanceof Error ? error.message : "Unknown" }, 500, origin);
     }
   }
-  
+
   if (path.endsWith("/bot-webhook") && method === "POST") {
     console.log("📩 Webhook received");
     if (!verifyWebhookSecret(req.headers)) {
@@ -1246,7 +1265,7 @@ serve(async (req: Request) => {
       return new Response("Error", { status: 500, headers: getCorsHeaders(origin) });
     }
   }
-  
+
   if (path.includes("/api/")) {
     try {
       const apiPath = path.substring(path.indexOf("/api/"));
@@ -1260,8 +1279,8 @@ serve(async (req: Request) => {
       return jsonResponse({ error: "Internal server error" }, 500, origin);
     }
   }
-  
-  return new Response("MySubHub API v2.4.1", { headers: getCorsHeaders(origin) });
+
+  return new Response("MySubHub API v2.5.0 - ESCROW", { headers: getCorsHeaders(origin) });
 });
 
 async function autoSetup() {
@@ -1277,12 +1296,12 @@ async function autoSetup() {
       ],
     });
     console.log("✅ Bot commands set");
-    
+
     await telegramApi("setChatMenuButton", {
       menu_button: { type: "web_app", text: "📱 Open MySubHub", web_app: { url: WEBAPP_URL } },
     });
     console.log("✅ Menu button set");
-    
+
     const webhookInfo = await telegramApi("getWebhookInfo");
     if (webhookInfo.ok) {
       const info = webhookInfo.result as Record<string, unknown>;
@@ -1294,4 +1313,4 @@ async function autoSetup() {
 }
 
 autoSetup();
-console.log("✅ MySubHub Backend v2.4.1 started");
+console.log("✅ MySubHub Backend v2.5.0 - ESCROW SYSTEM started");
