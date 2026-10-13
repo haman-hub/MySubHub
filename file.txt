@@ -12,7 +12,7 @@ const ADMIN_TON_WALLET = Deno.env.get("ADMIN_TON_WALLET");
 const TONCENTER_API_KEY = Deno.env.get("TONCENTER_API_KEY");
 const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET");
 const WEBAPP_URL = Deno.env.get("WEBAPP_URL") || "https://haman-hub.github.io/MySubHub-frontend";
-const TON_NETWORK = Deno.env.get("TON_NETWORK") || "testnet"; // FIXED: Default to mainnet
+const TON_NETWORK = Deno.env.get("TON_NETWORK") || "mainnet"; // FIXED: Default to mainnet
 const REFERRAL_CREDIT_PERCENT = 0.10;
 
 console.log(`🚀 Starting MySubHub Backend v2.4.1`);
@@ -799,15 +799,16 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
         }
       }
       
-      const totalPrice = parseFloat(channel.subscription_price as string);
+      const channelPrice = parseFloat(channel.subscription_price as string);
+      const platformFee = channelPrice * PLATFORM_FEE_PERCENT; // 1% platform fee
+      const totalPrice = channelPrice + platformFee; // Subscriber pays channel price + 1% fee
       const creditsAmount = parseFloat(credits_used as string) || 0;
       const remaining = totalPrice - creditsAmount;
       const remainingNano = BigInt(Math.round(remaining * 1e9));
       const totalNano = remainingNano + NETWORK_FEE_NANO;
       
-      const ownerUsers2 = await dbSelect("users", { telegram_id: channel.owner_id as number });
-      const ownerWallet = ownerUsers2[0]?.wallet_address;
-      if (!ownerWallet) return jsonResponse({ error: "Owner wallet not configured" }, 400, origin);
+      // All payments go to admin wallet (escrow system)
+      if (!ADMIN_TON_WALLET) return jsonResponse({ error: "Platform wallet not configured" }, 500, origin);
       
       const nonce = crypto.randomUUID();
       await dbInsert("payment_nonces", {
@@ -818,8 +819,17 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       });
       
       return jsonResponse({
-        paymentDetails: { wallet: ownerWallet, amountNano: totalNano.toString(), amount: remaining.toFixed(9), comment: nonce },
-        subscriptionDetails: { channel_id: channel.id, channel_name: channel.channel_name, price: totalPrice, credits_used: creditsAmount, remaining, duration_days: channel.duration_days },
+        paymentDetails: { wallet: ADMIN_TON_WALLET, amountNano: totalNano.toString(), amount: remaining.toFixed(9), comment: nonce },
+        subscriptionDetails: { 
+          channel_id: channel.id, 
+          channel_name: channel.channel_name, 
+          channel_price: channelPrice,
+          platform_fee: platformFee,
+          total_price: totalPrice,
+          credits_used: creditsAmount, 
+          remaining, 
+          duration_days: channel.duration_days 
+        },
         nonce,
       }, 200, origin);
     } catch (e: unknown) {
@@ -835,19 +845,19 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       if (channels.length === 0) return jsonResponse({ error: "Channel not found" }, 404, origin);
       const channel = channels[0];
       
-      const totalPrice = parseFloat(channel.subscription_price as string);
+      const channelPrice = parseFloat(channel.subscription_price as string);
+      const platformFeeAmount = channelPrice * PLATFORM_FEE_PERCENT; // 1% platform fee
+      const totalPrice = channelPrice + platformFeeAmount; // Subscriber pays channel price + 1% fee
       const creditsAmount = parseFloat(credits_used as string) || 0;
       const remaining = totalPrice - creditsAmount;
       
       let txHash = transaction_hash as string | undefined;
       if (remaining > 0 && !txHash) {
-        const ownerUsers = await dbSelect("users", { telegram_id: channel.owner_id as number });
-        const ownerWallet = ownerUsers[0]?.wallet_address;
-        if (ownerWallet) {
-          const result = await verifyTonPayment(ownerWallet, BigInt(Math.round(remaining * 1e9)), nonce as string);
-          if (!result.success) return jsonResponse({ error: result.error }, 400, origin);
-          txHash = result.txHash;
-        }
+        // Verify payment at ADMIN wallet (escrow system)
+        if (!ADMIN_TON_WALLET) return jsonResponse({ error: "Platform wallet not configured" }, 500, origin);
+        const result = await verifyTonPayment(ADMIN_TON_WALLET, BigInt(Math.round(remaining * 1e9)), nonce as string);
+        if (!result.success) return jsonResponse({ error: result.error }, 400, origin);
+        txHash = result.txHash;
       }
       if (!txHash) return jsonResponse({ error: "No valid transaction" }, 400, origin);
       
@@ -875,18 +885,19 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
         credits_used: creditsAmount,
       });
       
-      const platformFee = totalPrice * PLATFORM_FEE_PERCENT;
-      const creditPortion = totalPrice * REFERRAL_CREDIT_PERCENT;
-      const ownerShare = totalPrice - platformFee - creditPortion;
+      // Escrow system: Admin receives full payment, owes channel owner the channel price
+      // Platform fee (1%) is already collected by admin
+      // Owner share is the full channel price (to be paid out after withdrawal approval)
+      const ownerShare = channelPrice; // Channel owner gets the full channel price
       
       await dbInsert("platform_transactions", {
         subscription_id: subResult?.[0]?.id,
         user_id: telegramId,
         channel_id: channel_id as string,
         channel_owner_id: channel.owner_id,
-        amount_total: totalPrice,
-        owner_share: ownerShare,
-        platform_fee: platformFee,
+        amount_total: totalPrice, // What subscriber paid (channel price + 1% fee)
+        owner_share: ownerShare, // What channel owner is owed (full channel price)
+        platform_fee: platformFeeAmount, // 1% platform fee (kept by admin)
         network_fee: Number(NETWORK_FEE_NANO) / 1e9,
         transaction_hash: txHash,
       });
@@ -895,7 +906,8 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
         const referrerUsers = await dbSelect("users", { telegram_id: telegramId });
         const referrerId = referrerUsers[0]?.referred_by;
         if (referrerId) {
-          const creditAmount = totalPrice * REFERRAL_CREDIT_PERCENT;
+          // Referral credit is based on channel price (not including platform fee)
+          const creditAmount = channelPrice * REFERRAL_CREDIT_PERCENT;
           await dbRpc('add_credits', { 
             p_user_id: referrerId, 
             p_amount: creditAmount,
@@ -1140,8 +1152,29 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
         await dbUpdate("platform_transactions", { id: txId }, { owner_paid_out: true, withdrawal_id: withdrawalId });
       }
       
-      await dbUpdate("withdrawals", { id: withdrawalId }, { status: 'processed', processed_date: new Date().toISOString(), processed_by: telegramId });
-      return jsonResponse({ success: true, covered: coveredIds.length }, 200, origin);
+      // Get owner's wallet address for the transfer
+      const ownerUsers = await dbSelect("users", { telegram_id: withdrawal.channel_owner_id as number });
+      const ownerWallet = ownerUsers[0]?.wallet_address || withdrawal.wallet_address;
+      
+      await dbUpdate("withdrawals", { 
+        id: withdrawalId, 
+        status: 'processed', 
+        processed_date: new Date().toISOString(), 
+        processed_by: telegramId,
+        payout_tx_hash: 'PENDING_MANUAL_TRANSFER' // Admin needs to manually send TON
+      });
+      
+      // Return transfer instructions for admin
+      return jsonResponse({ 
+        success: true, 
+        covered: coveredIds.length,
+        transfer_instructions: {
+          from: ADMIN_TON_WALLET,
+          to: ownerWallet,
+          amount: parseFloat(withdrawal.amount as string),
+          note: "Admin must manually send this amount from platform wallet to channel owner's wallet"
+        }
+      }, 200, origin);
     } catch (e: unknown) {
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
