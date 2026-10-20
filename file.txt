@@ -1507,4 +1507,4 @@ async function autoSetup() {
 }
 
 autoSetup();
-console.log("✅ MySubHub Backend v2.6.0 - ALL 5 PHASES started");
+console.log("✅ MySubHub Backend v2.6.0 - ALL 5 PHASES started"); 
