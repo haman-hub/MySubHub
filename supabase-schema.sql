@@ -1,510 +1,237 @@
--- MySubHub Database Schema v2.6.0 - ALL 5 PHASES
--- Run this in Supabase SQL Editor
+-- WARNING: This schema is for context only and is not meant to be run.
+-- Table order and constraints may not be valid for execution.
 
--- =====================================================
--- PHASE 1: Add category support for Channel Discovery
--- =====================================================
-
--- Add category column to channels table
-ALTER TABLE channels ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'other';
-
--- Create index for faster category filtering
-CREATE INDEX IF NOT EXISTS idx_channels_category ON channels(category);
-
--- =====================================================
--- PHASE 2: Create notifications table
--- =====================================================
-
-CREATE TABLE IF NOT EXISTS notifications (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id BIGINT NOT NULL,
-  type TEXT NOT NULL,
-  title TEXT NOT NULL,
-  message TEXT NOT NULL,
-  data JSONB DEFAULT '{}',
-  read BOOLEAN DEFAULT false,
-  created_at TIMESTAMPTZ DEFAULT now()
+CREATE TABLE public.users (
+  telegram_id bigint NOT NULL,
+  first_name text,
+  last_name text,
+  username text,
+  wallet_address text,
+  role text DEFAULT 'user'::text CHECK (role = ANY (ARRAY['user'::text, 'owner'::text, 'admin'::text])),
+  created_at timestamp with time zone DEFAULT now(),
+  language_code text,
+  is_banned boolean DEFAULT false,
+  ban_reason text,
+  referral_code text UNIQUE,
+  referred_by bigint,
+  banned_at timestamp with time zone,
+  banned_reason text,
+  updated_at timestamp with time zone DEFAULT now(),
+  CONSTRAINT users_pkey PRIMARY KEY (telegram_id)
 );
-
--- Create indexes for faster queries
-CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id);
-CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(read);
-CREATE INDEX IF NOT EXISTS idx_notifications_created_at ON notifications(created_at DESC);
-
--- Enable RLS
-ALTER TABLE notifications ENABLE ROW LEVEL SECURITY;
-
--- Drop existing policies if they exist
-DROP POLICY IF EXISTS "notifications_select_own" ON notifications;
-DROP POLICY IF EXISTS "notifications_insert_own" ON notifications;
-DROP POLICY IF EXISTS "notifications_update_own" ON notifications;
-
--- Create policies
-CREATE POLICY "notifications_select_own" ON notifications
-  FOR SELECT USING (true);
-
-CREATE POLICY "notifications_insert_own" ON notifications
-  FOR INSERT WITH CHECK (true);
-
-CREATE POLICY "notifications_update_own" ON notifications
-  FOR UPDATE USING (true) WITH CHECK (true);
-
--- =====================================================
--- PHASE 3: Security - Fix all function search_path issues
--- =====================================================
-
--- Fix log_admin_action
-DROP FUNCTION IF EXISTS public.log_admin_action(BIGINT, TEXT, JSONB) CASCADE;
-CREATE OR REPLACE FUNCTION public.log_admin_action(
-  p_admin_id BIGINT,
-  p_action TEXT,
-  p_details JSONB DEFAULT NULL
-)
-RETURNS void
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $$
-BEGIN
-  INSERT INTO audit_log (admin_id, action, details, created_at)
-  VALUES (p_admin_id, p_action, p_details, NOW());
-END;
-$$;
-
--- Fix get_paginated_subscriptions
-DROP FUNCTION IF EXISTS public.get_paginated_subscriptions(INTEGER, INTEGER) CASCADE;
-CREATE OR REPLACE FUNCTION public.get_paginated_subscriptions(
-  p_limit INTEGER DEFAULT 10,
-  p_offset INTEGER DEFAULT 0
-)
-RETURNS TABLE (
-  id UUID,
-  user_id BIGINT,
-  channel_id UUID,
-  start_date TIMESTAMPTZ,
-  end_date TIMESTAMPTZ,
-  status TEXT,
-  created_at TIMESTAMPTZ
-)
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $$
-BEGIN
-  RETURN QUERY
-  SELECT s.id, s.user_id, s.channel_id, s.start_date, s.end_date, s.status, s.created_at
-  FROM subscriptions s
-  ORDER BY s.created_at DESC
-  LIMIT p_limit OFFSET p_offset;
-END;
-$$;
-
--- Fix award_referral_credits
-DROP FUNCTION IF EXISTS public.award_referral_credits(BIGINT, NUMERIC) CASCADE;
-CREATE OR REPLACE FUNCTION public.award_referral_credits(
-  p_user_id BIGINT,
-  p_amount NUMERIC
-)
-RETURNS void
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $$
-BEGIN
-  INSERT INTO referral_credits (user_id, balance, total_earned, created_at, updated_at)
-  VALUES (p_user_id, p_amount, p_amount, NOW(), NOW())
-  ON CONFLICT (user_id) 
-  DO UPDATE SET 
-    balance = referral_credits.balance + p_amount,
-    total_earned = referral_credits.total_earned + p_amount,
-    updated_at = NOW();
-    
-  INSERT INTO credit_transactions (user_id, type, amount, balance_after, description, created_at)
-  SELECT p_user_id, 'earned', p_amount, balance, 'Referral credit awarded', NOW()
-  FROM referral_credits WHERE user_id = p_user_id;
-END;
-$$;
-
--- Fix add_credits
-DROP FUNCTION IF EXISTS public.add_credits(BIGINT, NUMERIC) CASCADE;
-CREATE OR REPLACE FUNCTION public.add_credits(
-  p_user_id BIGINT,
-  p_amount NUMERIC
-)
-RETURNS void
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $$
-BEGIN
-  INSERT INTO referral_credits (user_id, balance, total_earned, created_at, updated_at)
-  VALUES (p_user_id, p_amount, p_amount, NOW(), NOW())
-  ON CONFLICT (user_id) 
-  DO UPDATE SET 
-    balance = referral_credits.balance + p_amount,
-    total_earned = referral_credits.total_earned + p_amount,
-    updated_at = NOW();
-    
-  INSERT INTO credit_transactions (user_id, type, amount, balance_after, description, created_at)
-  SELECT p_user_id, 'earned', p_amount, balance, 'Credits added', NOW()
-  FROM referral_credits WHERE user_id = p_user_id;
-END;
-$$;
-
--- Fix use_referral_credits
-DROP FUNCTION IF EXISTS public.use_referral_credits(BIGINT, NUMERIC) CASCADE;
-CREATE OR REPLACE FUNCTION public.use_referral_credits(
-  p_user_id BIGINT,
-  p_amount NUMERIC
-)
-RETURNS BOOLEAN
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $$
-DECLARE
-  v_balance NUMERIC;
-BEGIN
-  SELECT balance INTO v_balance FROM referral_credits WHERE user_id = p_user_id;
-  
-  IF v_balance IS NULL OR v_balance < p_amount THEN
-    RETURN FALSE;
-  END IF;
-  
-  UPDATE referral_credits 
-  SET balance = balance - p_amount,
-      total_used = total_used + p_amount,
-      updated_at = NOW()
-  WHERE user_id = p_user_id;
-  
-  INSERT INTO credit_transactions (user_id, type, amount, balance_after, description, created_at)
-  SELECT p_user_id, 'used', p_amount, balance, 'Credits used for subscription', NOW()
-  FROM referral_credits WHERE user_id = p_user_id;
-  
-  RETURN TRUE;
-END;
-$$;
-
--- Fix get_user_referral_stats
-DROP FUNCTION IF EXISTS public.get_user_referral_stats(BIGINT) CASCADE;
-CREATE OR REPLACE FUNCTION public.get_user_referral_stats(
-  p_user_id BIGINT
-)
-RETURNS TABLE (
-  total_referrals INTEGER,
-  total_credits_earned NUMERIC,
-  total_credits_used NUMERIC,
-  current_balance NUMERIC
-)
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $$
-BEGIN
-  RETURN QUERY
-  SELECT 
-    COUNT(*)::INTEGER as total_referrals,
-    COALESCE(SUM(credits_earned), 0) as total_credits_earned,
-    (SELECT COALESCE(total_used, 0) FROM referral_credits WHERE user_id = p_user_id) as total_credits_used,
-    (SELECT COALESCE(balance, 0) FROM referral_credits WHERE user_id = p_user_id) as current_balance
-  FROM referrals
-  WHERE referrer_id = p_user_id;
-END;
-$$;
-
--- Fix auto_generate_referral_code
-DROP FUNCTION IF EXISTS public.auto_generate_referral_code() CASCADE;
-CREATE OR REPLACE FUNCTION public.auto_generate_referral_code()
-RETURNS TRIGGER
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $$
-BEGIN
-  IF NEW.referral_code IS NULL OR NEW.referral_code = '' THEN
-    NEW.referral_code := public.generate_referral_code();
-  END IF;
-  RETURN NEW;
-END;
-$$;
-
--- Fix deduct_credits
-DROP FUNCTION IF EXISTS public.deduct_credits(BIGINT, NUMERIC) CASCADE;
-CREATE OR REPLACE FUNCTION public.deduct_credits(
-  p_user_id BIGINT,
-  p_amount NUMERIC
-)
-RETURNS BOOLEAN
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $$
-BEGIN
-  UPDATE referral_credits 
-  SET balance = balance - p_amount,
-      total_used = total_used + p_amount,
-      updated_at = NOW()
-  WHERE user_id = p_user_id AND balance >= p_amount;
-  
-  IF FOUND THEN
-    INSERT INTO credit_transactions (user_id, type, amount, balance_after, description, created_at)
-    SELECT p_user_id, 'used', p_amount, balance, 'Credits deducted', NOW()
-    FROM referral_credits WHERE user_id = p_user_id;
-    RETURN TRUE;
-  END IF;
-  
-  RETURN FALSE;
-END;
-$$;
-
--- Fix expire_subscription
-DROP FUNCTION IF EXISTS public.expire_subscription(UUID) CASCADE;
-CREATE OR REPLACE FUNCTION public.expire_subscription(
-  p_subscription_id UUID
-)
-RETURNS void
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $$
-BEGIN
-  UPDATE subscriptions
-  SET status = 'expired',
-      updated_at = NOW()
-  WHERE id = p_subscription_id
-  AND status = 'active'
-  AND end_date < NOW();
-END;
-$$;
-
--- Fix get_expiring_subscriptions
-DROP FUNCTION IF EXISTS public.get_expiring_subscriptions(INTEGER) CASCADE;
-CREATE OR REPLACE FUNCTION public.get_expiring_subscriptions(
-  p_days_ahead INTEGER DEFAULT 7
-)
-RETURNS TABLE (
-  id UUID,
-  user_id BIGINT,
-  channel_id UUID,
-  end_date TIMESTAMPTZ,
-  days_remaining INTEGER
-)
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $$
-BEGIN
-  RETURN QUERY
-  SELECT 
-    s.id,
-    s.user_id,
-    s.channel_id,
-    s.end_date,
-    EXTRACT(DAY FROM s.end_date - NOW())::INTEGER as days_remaining
-  FROM subscriptions s
-  WHERE s.status = 'active'
-  AND s.end_date BETWEEN NOW() AND NOW() + (p_days_ahead || ' days')::INTERVAL
-  ORDER BY s.end_date ASC;
-END;
-$$;
-
--- Fix cleanup_expired_nonces
-DROP FUNCTION IF EXISTS public.cleanup_expired_nonces() CASCADE;
-CREATE OR REPLACE FUNCTION public.cleanup_expired_nonces()
-RETURNS INTEGER
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $$
-DECLARE
-  v_deleted_count INTEGER;
-BEGIN
-  WITH deleted AS (
-    DELETE FROM payment_nonces
-    WHERE expires_at < NOW() AND used = false
-    RETURNING *
-  )
-  SELECT COUNT(*) INTO v_deleted_count FROM deleted;
-  
-  RETURN v_deleted_count;
-END;
-$$;
-
--- Fix expire_overdue_subscriptions
-DROP FUNCTION IF EXISTS public.expire_overdue_subscriptions() CASCADE;
-CREATE OR REPLACE FUNCTION public.expire_overdue_subscriptions()
-RETURNS INTEGER
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $$
-DECLARE
-  v_expired_count INTEGER;
-BEGIN
-  WITH expired AS (
-    UPDATE subscriptions
-    SET status = 'expired',
-        updated_at = NOW()
-    WHERE status = 'active'
-    AND end_date < NOW()
-    RETURNING *
-  )
-  SELECT COUNT(*) INTO v_expired_count FROM expired;
-  
-  RETURN v_expired_count;
-END;
-$$;
-
--- Fix update_channel_analytics (trigger function)
-DROP FUNCTION IF EXISTS public.update_channel_analytics() CASCADE;
-CREATE OR REPLACE FUNCTION public.update_channel_analytics()
-RETURNS trigger
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $$
-BEGIN
-  IF TG_TABLE_NAME = 'subscriptions' THEN
-    IF TG_OP = 'DELETE' THEN
-      UPDATE channels c
-      SET 
-        total_subscribers = sub.count,
-        total_earnings = earn.sum
-      FROM (
-        SELECT channel_id, COUNT(*) as count
-        FROM subscriptions
-        WHERE status = 'active' AND channel_id = OLD.channel_id
-        GROUP BY channel_id
-      ) sub,
-      (
-        SELECT channel_id, COALESCE(SUM(amount_total), 0) as sum
-        FROM platform_transactions
-        WHERE channel_id = OLD.channel_id
-        GROUP BY channel_id
-      ) earn
-      WHERE c.id = OLD.channel_id;
-    ELSE
-      UPDATE channels c
-      SET 
-        total_subscribers = sub.count,
-        total_earnings = earn.sum
-      FROM (
-        SELECT channel_id, COUNT(*) as count
-        FROM subscriptions
-        WHERE status = 'active' AND channel_id = NEW.channel_id
-        GROUP BY channel_id
-      ) sub,
-      (
-        SELECT channel_id, COALESCE(SUM(amount_total), 0) as sum
-        FROM platform_transactions
-        WHERE channel_id = NEW.channel_id
-        GROUP BY channel_id
-      ) earn
-      WHERE c.id = NEW.channel_id;
-    END IF;
-  ELSIF TG_TABLE_NAME = 'reviews' THEN
-    IF TG_OP = 'DELETE' THEN
-      UPDATE channels
-      SET review_count = (SELECT COUNT(*) FROM reviews WHERE channel_id = OLD.channel_id AND is_hidden = false)
-      WHERE id = OLD.channel_id;
-    ELSE
-      UPDATE channels
-      SET review_count = (SELECT COUNT(*) FROM reviews WHERE channel_id = NEW.channel_id AND is_hidden = false)
-      WHERE id = NEW.channel_id;
-    END IF;
-  END IF;
-  
-  IF TG_OP = 'DELETE' THEN
-    RETURN OLD;
-  ELSE
-    RETURN NEW;
-  END IF;
-END;
-$$;
-
--- Recreate triggers
-DROP TRIGGER IF EXISTS trigger_update_channel_analytics_sub ON subscriptions;
-CREATE TRIGGER trigger_update_channel_analytics_sub
-AFTER INSERT OR UPDATE OR DELETE ON subscriptions
-FOR EACH STATEMENT
-EXECUTE FUNCTION update_channel_analytics();
-
-DROP TRIGGER IF EXISTS trigger_update_channel_analytics_rev ON reviews;
-CREATE TRIGGER trigger_update_channel_analytics_rev
-AFTER INSERT OR UPDATE OR DELETE ON reviews
-FOR EACH STATEMENT
-EXECUTE FUNCTION update_channel_analytics();
-
--- =====================================================
--- PHASE 3: Revoke EXECUTE from anon and authenticated
--- =====================================================
-
--- Revoke from anon role
-REVOKE EXECUTE ON FUNCTION public.log_admin_action(BIGINT, TEXT, JSONB) FROM anon;
-REVOKE EXECUTE ON FUNCTION public.get_paginated_subscriptions(INTEGER, INTEGER) FROM anon;
-REVOKE EXECUTE ON FUNCTION public.award_referral_credits(BIGINT, NUMERIC) FROM anon;
-REVOKE EXECUTE ON FUNCTION public.add_credits(BIGINT, NUMERIC) FROM anon;
-REVOKE EXECUTE ON FUNCTION public.use_referral_credits(BIGINT, NUMERIC) FROM anon;
-REVOKE EXECUTE ON FUNCTION public.get_user_referral_stats(BIGINT) FROM anon;
-REVOKE EXECUTE ON FUNCTION public.auto_generate_referral_code() FROM anon;
-REVOKE EXECUTE ON FUNCTION public.deduct_credits(BIGINT, NUMERIC) FROM anon;
-REVOKE EXECUTE ON FUNCTION public.expire_subscription(UUID) FROM anon;
-REVOKE EXECUTE ON FUNCTION public.get_expiring_subscriptions(INTEGER) FROM anon;
-REVOKE EXECUTE ON FUNCTION public.cleanup_expired_nonces() FROM anon;
-REVOKE EXECUTE ON FUNCTION public.expire_overdue_subscriptions() FROM anon;
-REVOKE EXECUTE ON FUNCTION public.update_channel_analytics() FROM anon;
-
--- Revoke from authenticated role
-REVOKE EXECUTE ON FUNCTION public.log_admin_action(BIGINT, TEXT, JSONB) FROM authenticated;
-REVOKE EXECUTE ON FUNCTION public.get_paginated_subscriptions(INTEGER, INTEGER) FROM authenticated;
-REVOKE EXECUTE ON FUNCTION public.award_referral_credits(BIGINT, NUMERIC) FROM authenticated;
-REVOKE EXECUTE ON FUNCTION public.add_credits(BIGINT, NUMERIC) FROM authenticated;
-REVOKE EXECUTE ON FUNCTION public.use_referral_credits(BIGINT, NUMERIC) FROM authenticated;
-REVOKE EXECUTE ON FUNCTION public.get_user_referral_stats(BIGINT) FROM authenticated;
-REVOKE EXECUTE ON FUNCTION public.auto_generate_referral_code() FROM authenticated;
-REVOKE EXECUTE ON FUNCTION public.deduct_credits(BIGINT, NUMERIC) FROM authenticated;
-REVOKE EXECUTE ON FUNCTION public.expire_subscription(UUID) FROM authenticated;
-REVOKE EXECUTE ON FUNCTION public.get_expiring_subscriptions(INTEGER) FROM authenticated;
-REVOKE EXECUTE ON FUNCTION public.cleanup_expired_nonces() FROM authenticated;
-REVOKE EXECUTE ON FUNCTION public.expire_overdue_subscriptions() FROM authenticated;
-REVOKE EXECUTE ON FUNCTION public.update_channel_analytics() FROM authenticated;
-
--- =====================================================
--- VERIFICATION
--- =====================================================
-
--- Verify notifications table exists
-SELECT COUNT(*) as notifications_table_exists FROM information_schema.tables WHERE table_name = 'notifications';
-
--- Verify category column exists
-SELECT COUNT(*) as category_column_exists FROM information_schema.columns WHERE table_name = 'channels' AND column_name = 'category';
-
--- Verify all functions have fixed search_path
-SELECT proname, proconfig 
-FROM pg_proc 
-WHERE pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
-AND proname IN (
-  'update_channel_analytics', 
-  'log_admin_action', 
-  'add_credits',
-  'deduct_credits',
-  'award_referral_credits'
+CREATE TABLE public.channels (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  owner_id bigint,
+  channel_name text NOT NULL,
+  channel_chat_id bigint,
+  channel_invite_link text,
+  subscription_price numeric NOT NULL CHECK (subscription_price > 0::numeric),
+  duration_days integer NOT NULL CHECK (duration_days > 0),
+  is_active boolean DEFAULT true,
+  auto_renewal_reminders boolean DEFAULT false,
+  created_at timestamp with time zone DEFAULT now(),
+  avg_rating numeric DEFAULT 0,
+  total_reviews integer DEFAULT 0,
+  total_subscribers integer DEFAULT 0,
+  is_verified boolean DEFAULT false,
+  verified_at timestamp with time zone,
+  verification_notes text,
+  channel_type text DEFAULT 'channel'::text CHECK (channel_type = ANY (ARRAY['channel'::text, 'group'::text])),
+  auto_post_enabled boolean DEFAULT false,
+  auto_post_template text,
+  last_posted_at timestamp with time zone,
+  description text,
+  total_earnings numeric DEFAULT 0,
+  updated_at timestamp with time zone DEFAULT now(),
+  category text DEFAULT 'other'::text,
+  CONSTRAINT channels_pkey PRIMARY KEY (id),
+  CONSTRAINT channels_owner_id_fkey FOREIGN KEY (owner_id) REFERENCES public.users(telegram_id)
 );
-
--- Verify function permissions are revoked
-SELECT proname, 
-       has_function_privilege('anon', p.oid, 'execute') as anon_can_execute,
-       has_function_privilege('authenticated', p.oid, 'execute') as auth_can_execute
-FROM pg_proc p
-WHERE pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
-AND proname IN ('add_credits', 'deduct_credits', 'expire_overdue_subscriptions');
-
--- =====================================================
--- DONE
--- =====================================================
--- All 5 phases database updates complete!
--- ✅ Phase 1: Category support added
--- ✅ Phase 2: Notifications table created
--- ✅ Phase 3: All functions fixed with search_path
--- ✅ Phase 3: All permissions revoked from anon/authenticated
--- ✅ Phase 4 & 5: No database changes needed (frontend only)
+CREATE TABLE public.subscriptions (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  user_id bigint,
+  channel_id uuid,
+  start_date timestamp with time zone DEFAULT now(),
+  end_date timestamp with time zone NOT NULL,
+  transaction_hash text,
+  amount numeric,
+  status text DEFAULT 'active'::text CHECK (status = ANY (ARRAY['active'::text, 'expired'::text, 'cancelled'::text])),
+  auto_renew boolean DEFAULT false,
+  created_at timestamp with time zone DEFAULT now(),
+  reminder_count integer DEFAULT 0,
+  renewed_from uuid,
+  credits_used numeric DEFAULT 0,
+  updated_at timestamp with time zone DEFAULT now(),
+  CONSTRAINT subscriptions_pkey PRIMARY KEY (id),
+  CONSTRAINT subscriptions_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(telegram_id),
+  CONSTRAINT subscriptions_channel_id_fkey FOREIGN KEY (channel_id) REFERENCES public.channels(id),
+  CONSTRAINT subscriptions_renewed_from_fkey FOREIGN KEY (renewed_from) REFERENCES public.subscriptions(id)
+);
+CREATE TABLE public.platform_transactions (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  subscription_id uuid,
+  user_id bigint,
+  channel_id uuid,
+  channel_owner_id bigint,
+  amount_total numeric,
+  owner_share numeric,
+  platform_fee numeric,
+  transaction_hash text,
+  owner_paid_out boolean DEFAULT false,
+  paid_out_tx_hash text,
+  created_at timestamp with time zone DEFAULT now(),
+  network_fee numeric DEFAULT 0,
+  withdrawal_id uuid,
+  CONSTRAINT platform_transactions_pkey PRIMARY KEY (id),
+  CONSTRAINT platform_transactions_subscription_id_fkey FOREIGN KEY (subscription_id) REFERENCES public.subscriptions(id),
+  CONSTRAINT platform_transactions_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(telegram_id),
+  CONSTRAINT platform_transactions_channel_id_fkey FOREIGN KEY (channel_id) REFERENCES public.channels(id),
+  CONSTRAINT platform_transactions_channel_owner_id_fkey FOREIGN KEY (channel_owner_id) REFERENCES public.users(telegram_id)
+);
+CREATE TABLE public.withdrawals (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  channel_owner_id bigint,
+  amount numeric NOT NULL,
+  status text DEFAULT 'pending'::text CHECK (status = ANY (ARRAY['pending'::text, 'approved'::text, 'rejected'::text, 'processed'::text])),
+  request_date timestamp with time zone DEFAULT now(),
+  processed_date timestamp with time zone,
+  payout_tx_hash text,
+  admin_notes text,
+  rejection_reason text,
+  processed_by bigint,
+  wallet_address text,
+  CONSTRAINT withdrawals_pkey PRIMARY KEY (id),
+  CONSTRAINT withdrawals_channel_owner_id_fkey FOREIGN KEY (channel_owner_id) REFERENCES public.users(telegram_id)
+);
+CREATE TABLE public.reports (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  reporter_id bigint,
+  reported_channel_id uuid,
+  reason text NOT NULL,
+  description text,
+  status text DEFAULT 'pending'::text CHECK (status = ANY (ARRAY['pending'::text, 'reviewed'::text, 'dismissed'::text, 'banned'::text, 'resolved'::text])),
+  reviewed_by bigint,
+  created_at timestamp with time zone DEFAULT now(),
+  reviewed_at timestamp with time zone,
+  admin_notes text,
+  CONSTRAINT reports_pkey PRIMARY KEY (id),
+  CONSTRAINT reports_reporter_id_fkey FOREIGN KEY (reporter_id) REFERENCES public.users(telegram_id),
+  CONSTRAINT reports_reported_channel_id_fkey FOREIGN KEY (reported_channel_id) REFERENCES public.channels(id),
+  CONSTRAINT reports_reviewed_by_fkey FOREIGN KEY (reviewed_by) REFERENCES public.users(telegram_id)
+);
+CREATE TABLE public.reviews (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  user_id bigint,
+  channel_id uuid,
+  rating integer CHECK (rating >= 1 AND rating <= 5),
+  comment text,
+  created_at timestamp with time zone DEFAULT now(),
+  is_hidden boolean DEFAULT false,
+  updated_at timestamp with time zone DEFAULT now(),
+  CONSTRAINT reviews_pkey PRIMARY KEY (id),
+  CONSTRAINT reviews_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(telegram_id),
+  CONSTRAINT reviews_channel_id_fkey FOREIGN KEY (channel_id) REFERENCES public.channels(id)
+);
+CREATE TABLE public.audit_log (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  admin_id bigint NOT NULL,
+  action text NOT NULL,
+  target_type text,
+  target_id text,
+  details jsonb,
+  created_at timestamp with time zone DEFAULT now(),
+  CONSTRAINT audit_log_pkey PRIMARY KEY (id)
+);
+CREATE TABLE public.user_preferences (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  user_id bigint NOT NULL UNIQUE,
+  theme text DEFAULT 'dark'::text CHECK (theme = ANY (ARRAY['dark'::text, 'light'::text, 'system'::text])),
+  tutorial_completed boolean DEFAULT false,
+  notifications_enabled boolean DEFAULT true,
+  language text DEFAULT 'en'::text,
+  created_at timestamp with time zone DEFAULT now(),
+  updated_at timestamp with time zone DEFAULT now(),
+  CONSTRAINT user_preferences_pkey PRIMARY KEY (id)
+);
+CREATE TABLE public.verification_requests (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  channel_id uuid NOT NULL,
+  owner_id bigint NOT NULL,
+  status text DEFAULT 'pending'::text CHECK (status = ANY (ARRAY['pending'::text, 'approved'::text, 'rejected'::text])),
+  evidence text,
+  admin_notes text,
+  reviewed_by bigint,
+  reviewed_at timestamp with time zone,
+  created_at timestamp with time zone DEFAULT now(),
+  CONSTRAINT verification_requests_pkey PRIMARY KEY (id),
+  CONSTRAINT verification_requests_channel_id_fkey FOREIGN KEY (channel_id) REFERENCES public.channels(id)
+);
+CREATE TABLE public.referrals (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  referrer_id bigint NOT NULL,
+  referred_id bigint NOT NULL,
+  subscription_id uuid,
+  subscription_amount numeric NOT NULL,
+  credits_earned numeric NOT NULL,
+  status text DEFAULT 'completed'::text CHECK (status = ANY (ARRAY['pending'::text, 'completed'::text, 'cancelled'::text])),
+  created_at timestamp with time zone DEFAULT now(),
+  CONSTRAINT referrals_pkey PRIMARY KEY (id),
+  CONSTRAINT referrals_referrer_id_fkey FOREIGN KEY (referrer_id) REFERENCES public.users(telegram_id),
+  CONSTRAINT referrals_referred_id_fkey FOREIGN KEY (referred_id) REFERENCES public.users(telegram_id),
+  CONSTRAINT referrals_subscription_id_fkey FOREIGN KEY (subscription_id) REFERENCES public.subscriptions(id)
+);
+CREATE TABLE public.referral_credits (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  user_id bigint NOT NULL,
+  balance numeric NOT NULL DEFAULT 0,
+  total_earned numeric NOT NULL DEFAULT 0,
+  total_used numeric NOT NULL DEFAULT 0,
+  updated_at timestamp with time zone DEFAULT now(),
+  CONSTRAINT referral_credits_pkey PRIMARY KEY (id),
+  CONSTRAINT referral_credits_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(telegram_id)
+);
+CREATE TABLE public.credit_transactions (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  user_id bigint NOT NULL,
+  type text NOT NULL CHECK (type = ANY (ARRAY['earned'::text, 'used'::text, 'expired'::text])),
+  amount numeric NOT NULL,
+  balance_after numeric NOT NULL,
+  description text,
+  reference_id uuid,
+  created_at timestamp with time zone DEFAULT now(),
+  CONSTRAINT credit_transactions_pkey PRIMARY KEY (id),
+  CONSTRAINT credit_transactions_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(telegram_id)
+);
+CREATE TABLE public.withdrawal_transactions (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  withdrawal_id uuid,
+  platform_transaction_id uuid,
+  amount numeric NOT NULL,
+  created_at timestamp with time zone DEFAULT now(),
+  CONSTRAINT withdrawal_transactions_pkey PRIMARY KEY (id),
+  CONSTRAINT withdrawal_transactions_withdrawal_id_fkey FOREIGN KEY (withdrawal_id) REFERENCES public.withdrawals(id),
+  CONSTRAINT withdrawal_transactions_platform_transaction_id_fkey FOREIGN KEY (platform_transaction_id) REFERENCES public.platform_transactions(id)
+);
+CREATE TABLE public.payment_nonces (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  user_id bigint,
+  channel_id uuid,
+  nonce text NOT NULL UNIQUE,
+  expires_at timestamp with time zone NOT NULL,
+  used boolean DEFAULT false,
+  created_at timestamp with time zone DEFAULT now(),
+  CONSTRAINT payment_nonces_pkey PRIMARY KEY (id),
+  CONSTRAINT payment_nonces_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(telegram_id),
+  CONSTRAINT payment_nonces_channel_id_fkey FOREIGN KEY (channel_id) REFERENCES public.channels(id)
+);
+CREATE TABLE public.notifications (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  user_id bigint NOT NULL,
+  type text NOT NULL,
+  title text NOT NULL,
+  message text NOT NULL,
+  data jsonb DEFAULT '{}'::jsonb,
+  read boolean DEFAULT false,
+  created_at timestamp with time zone DEFAULT now(),
+  CONSTRAINT notifications_pkey PRIMARY KEY (id)
+);
