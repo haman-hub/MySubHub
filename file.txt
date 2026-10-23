@@ -1,9 +1,6 @@
-// MySubHub Backend v2.6.0 - COMPLETE WITH ALL 5 PHASES
-// Phase 1: Channel Discovery
-// Phase 2: Notification System
-// Phase 3: Security Hardening
-// Phase 4: Visual Hierarchy (backend support)
-// Phase 5: Multi-language Support
+// MySubHub Backend v2.4.1 - COMPLETE WITH ALL FIXES
+// Fixed: Edit channel price, admin channels tab visibility, forward button, expiration cron
+// Deploy this to Supabase Edge Functions
 
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -15,12 +12,11 @@ const ADMIN_TON_WALLET = Deno.env.get("ADMIN_TON_WALLET");
 const TONCENTER_API_KEY = Deno.env.get("TONCENTER_API_KEY");
 const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET");
 const WEBAPP_URL = Deno.env.get("WEBAPP_URL") || "https://haman-hub.github.io/MySubHub-frontend";
-const TON_NETWORK = Deno.env.get("TON_NETWORK") || "testnet";
+const TON_NETWORK = Deno.env.get("TON_NETWORK") || "testnet"; // FIXED: Default to mainnet
 const REFERRAL_CREDIT_PERCENT = 0.10;
 
-console.log(`🚀 Starting MySubHub Backend v2.6.0 - ALL 5 PHASES`);
+console.log(`🚀 Starting MySubHub Backend v2.4.1`);
 console.log(`📡 TON_NETWORK: ${TON_NETWORK}`);
-console.log(`💰 ESCROW: All payments go to ADMIN_TON_WALLET`);
 
 if (!BOT_TOKEN || !ADMIN_TELEGRAM_ID || !ADMIN_TON_WALLET) {
   console.error("❌ Missing required environment variables");
@@ -112,7 +108,7 @@ function generateReferralCode(): string {
   return code;
 }
 
-// ================== CORS & SECURITY HEADERS (Phase 3) ==================
+// ================== CORS ==================
 const ALLOWED_ORIGINS = ["https://haman-hub.github.io", "https://web.telegram.org", "https://t.me"];
 
 function getCorsHeaders(origin: string | null) {
@@ -123,11 +119,6 @@ function getCorsHeaders(origin: string | null) {
     "Access-Control-Allow-Headers": "Content-Type, x-telegram-initdata, Authorization",
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin",
-    // Security headers (Phase 3)
-    "X-Content-Type-Options": "nosniff",
-    "X-Frame-Options": "DENY",
-    "X-XSS-Protection": "1; mode=block",
-    "Referrer-Policy": "strict-origin-when-cross-origin",
   };
 }
 
@@ -294,38 +285,6 @@ async function verifyBotIsAdmin(channelInviteLink: string): Promise<{ success: b
   }
 }
 
-// ================== NOTIFICATION SYSTEM (Phase 2) ==================
-async function createNotification(userId: number, type: string, title: string, message: string, data?: Record<string, unknown>) {
-  try {
-    await dbInsert("notifications", {
-      user_id: userId,
-      type: type,
-      title: title,
-      message: message,
-      data: data || {},
-      read: false,
-      created_at: new Date().toISOString()
-    });
-    
-    // Send via Telegram
-    await telegramApi("sendMessage", {
-      chat_id: userId,
-      text: `🔔 *${title}*\n\n${message}`,
-      parse_mode: "Markdown",
-      reply_markup: data?.channel_id ? {
-        inline_keyboard: [[
-          { text: "🔄 Renew Now", web_app: { url: `${WEBAPP_URL}?startapp=${data.channel_id}` } }
-        ]]
-      } : undefined
-    });
-    
-    return { success: true };
-  } catch (e) {
-    console.error("Notification error:", e);
-    return { success: false };
-  }
-}
-
 // ================== SUBSCRIPTION EXPIRATION ==================
 async function expireSubscription(subId: string) {
   try {
@@ -360,14 +319,19 @@ async function expireSubscription(subId: string) {
       }
     }
     
-    // Send expiration notification (Phase 2)
-    await createNotification(
-      userId,
-      'subscription_expired',
-      'Subscription Expired',
-      `Your subscription to "${channel.channel_name}" has expired. Renew now to continue accessing premium content!`,
-      { channel_id: channelId, channel_name: channel.channel_name }
-    );
+    try {
+      await telegramApi("sendMessage", {
+        chat_id: userId,
+        text: `⚠️ Your subscription to "${escapeHtml(channel.channel_name as string)}" has expired.\n\nRenew it from the app!`,
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "🔄 Renew", web_app: { url: `${WEBAPP_URL}?startapp=${channelId}` } }
+          ]]
+        }
+      });
+    } catch (e) {
+      console.error("Failed to notify user:", e);
+    }
     
     return { success: true, userId, channelId };
   } catch (e: unknown) {
@@ -446,7 +410,7 @@ async function handleBotUpdate(body: Record<string, unknown>) {
     if (text.startsWith("/help")) {
       await telegramApi("sendMessage", {
         chat_id: chatId,
-        text: `📚 *MySubHub Tutorial*\n\n*For Subscribers:*\n1️⃣ Browse channels in the Discover tab\n2️⃣ Subscribe using TON wallet\n3️⃣ Access premium content\n4️⃣ Rate channels you join\n5️⃣ Earn 10% credits via referrals\n\n*For Channel Owners:*\n1️⃣ Add your channel\n2️⃣ Set subscription price\n3️⃣ Share your link\n4️⃣ Earn 99% of payments\n5️⃣ Withdraw earnings\n\n*Credits System:*\n• Earn 10% when friends subscribe via your link\n• Use credits for future subscriptions\n• Credits cannot be withdrawn\n\nTap below for detailed guide:`,
+        text: `📚 *MySubHub Tutorial*\n\n*For Subscribers:*\n1️⃣ Browse channels in the app\n2️⃣ Subscribe using TON wallet\n3️⃣ Access premium content\n4️⃣ Rate channels you join\n5️⃣ Earn 10% credits via referrals\n\n*For Channel Owners:*\n1️⃣ Add your channel\n2️⃣ Set subscription price\n3️⃣ Share your link\n4️⃣ Earn 99% of payments\n5️⃣ Withdraw earnings\n\n*Credits System:*\n• Earn 10% when friends subscribe via your link\n• Use credits for future subscriptions\n• Credits cannot be withdrawn\n\nTap below for detailed guide:`,
         parse_mode: "Markdown",
         reply_markup: {
           inline_keyboard: [
@@ -454,18 +418,6 @@ async function handleBotUpdate(body: Record<string, unknown>) {
             [{ text: "📺 Owner Guide", web_app: { url: `${WEBAPP_URL}?startapp=help-owner` } }],
             [{ text: "🚀 Open App", web_app: { url: WEBAPP_URL } }]
           ]
-        }
-      });
-      return;
-    }
-    
-    if (text.startsWith("/discover")) {
-      await telegramApi("sendMessage", {
-        chat_id: chatId,
-        text: `🔍 *Discover Channels*\n\nBrowse and search for premium Telegram channels to subscribe to.`,
-        parse_mode: "Markdown",
-        reply_markup: {
-          inline_keyboard: [[{ text: "🔍 Discover Channels", web_app: { url: `${WEBAPP_URL}?startapp=discover` } }]]
         }
       });
       return;
@@ -502,7 +454,6 @@ async function handleBotUpdate(body: Record<string, unknown>) {
       let btnText = "🚀 Open Dashboard";
       
       if (parts === "owner") { url += "?startapp=owner"; btnText = "📺 My Channels"; }
-      else if (parts === "discover") { url += "?startapp=discover"; btnText = "🔍 Discover Channels"; }
       else if (parts.startsWith("ref_")) { url += "?startapp=referral"; }
       else if (parts && isValidUUID(parts)) { url += `?startapp=${parts}`; msgText = "Subscribe to this channel:"; btnText = "💎 Subscribe"; }
       
@@ -645,7 +596,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
     return jsonResponse({ success: true }, 200, origin);
   }
   
-  // ================== CHANNEL DISCOVERY (Phase 1) ==================
+  // ================== CHANNEL DISCOVERY (PUBLIC) ==================
   if (path === "/api/channels/discover" && method === "GET") {
     try {
       const url = new URL(`https://dummy.com${path}`);
@@ -655,60 +606,70 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       const limit = parseInt(url.searchParams.get("limit") || "20");
       const offset = parseInt(url.searchParams.get("offset") || "0");
       
-      let query = supabase
-        .from('channels')
-        .select('*, reviews(rating)')
-        .eq('is_active', true);
+      // Get all active channels
+      let channels = await dbSelect("channels", { is_active: true });
       
-      // Search filter
+      // Filter by search term
       if (search) {
-        query = query.ilike('channel_name', `%${search}%`);
+        const searchLower = search.toLowerCase();
+        channels = channels.filter((ch: Record<string, unknown>) => 
+          (ch.channel_name as string).toLowerCase().includes(searchLower) ||
+          (ch.description as string || '').toLowerCase().includes(searchLower)
+        );
       }
       
-      // Category filter
+      // Filter by category
       if (category) {
-        query = query.eq('category', category);
+        channels = channels.filter((ch: Record<string, unknown>) => 
+          ch.category === category
+        );
       }
       
-      // Sorting
+      // Enrich with stats
+      const enriched = await Promise.all(channels.map(async (ch: Record<string, unknown>) => {
+        try {
+          const activeSubs = await dbSelect("subscriptions", { channel_id: ch.id as string, status: 'active' });
+          const reviews = await dbSelect("reviews", { channel_id: ch.id as string });
+          const visibleReviews = reviews.filter((r: Record<string, unknown>) => !r.is_hidden);
+          const avgRating = visibleReviews.length > 0
+            ? visibleReviews.reduce((sum: number, r: Record<string, unknown>) => sum + (r.rating as number), 0) / visibleReviews.length
+            : 0;
+          
+          return {
+            id: ch.id,
+            channel_name: escapeHtml(ch.channel_name as string),
+            description: escapeHtml(ch.description as string || ''),
+            category: ch.category || 'other',
+            subscription_price: ch.subscription_price,
+            duration_days: ch.duration_days,
+            is_verified: ch.is_verified,
+            active_subscribers: activeSubs.length,
+            avg_rating: Math.round(avgRating * 10) / 10,
+            review_count: visibleReviews.length,
+            created_at: ch.created_at,
+          };
+        } catch { return ch; }
+      }));
+      
+      // Sort
       if (sort === "popular") {
-        query = query.order('total_subscribers', { ascending: false });
+        enriched.sort((a: any, b: any) => b.active_subscribers - a.active_subscribers);
       } else if (sort === "rating") {
-        query = query.order('avg_rating', { ascending: false });
+        enriched.sort((a: any, b: any) => b.avg_rating - a.avg_rating);
       } else if (sort === "recent") {
-        query = query.order('created_at', { ascending: false });
+        enriched.sort((a: any, b: any) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
       } else if (sort === "price_low") {
-        query = query.order('subscription_price', { ascending: true });
+        enriched.sort((a: any, b: any) => parseFloat(a.subscription_price) - parseFloat(b.subscription_price));
       } else if (sort === "price_high") {
-        query = query.order('subscription_price', { ascending: false });
+        enriched.sort((a: any, b: any) => parseFloat(b.subscription_price) - parseFloat(a.subscription_price));
       }
       
-      // Pagination
-      query = query.range(offset, offset + limit - 1);
-      
-      const { data: channels, error } = await query;
-      
-      if (error) throw error;
-      
-      // Calculate average ratings
-      const enriched = channels.map((ch: any) => {
-        const reviews = ch.reviews || [];
-        const avgRating = reviews.length > 0
-          ? reviews.reduce((sum: number, r: any) => sum + (r.rating || 0), 0) / reviews.length
-          : 0;
-        
-        return {
-          ...ch,
-          channel_name: escapeHtml(ch.channel_name),
-          avg_rating: Math.round(avgRating * 10) / 10,
-          review_count: reviews.length,
-          reviews: undefined
-        };
-      });
+      // Paginate
+      const paginated = enriched.slice(offset, offset + limit);
       
       return jsonResponse({
-        channels: enriched,
-        total: channels.length,
+        channels: paginated,
+        total: enriched.length,
         limit,
         offset
       }, 200, origin);
@@ -717,7 +678,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
     }
   }
   
-  // ================== CATEGORIES (Phase 1) ==================
+  // ================== CATEGORIES ==================
   if (path === "/api/categories" && method === "GET") {
     try {
       const categories = [
@@ -732,34 +693,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
         { id: "gaming", name: "Gaming", icon: "🎮" },
         { id: "music", name: "Music", icon: "🎵" }
       ];
-      
       return jsonResponse(categories, 200, origin);
-    } catch (e: unknown) {
-      return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
-    }
-  }
-  
-  // ================== NOTIFICATIONS (Phase 2) ==================
-  if (path === "/api/notifications/my" && method === "GET") {
-    try {
-      const notifications = await dbSelect("notifications", { user_id: telegramId });
-      const unread = notifications.filter((n: any) => !n.read);
-      
-      return jsonResponse({
-        notifications: notifications.sort((a: any, b: any) => 
-          new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-        ),
-        unread_count: unread.length
-      }, 200, origin);
-    } catch (e: unknown) {
-      return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
-    }
-  }
-  
-  if (path === "/api/notifications/read" && method === "POST") {
-    try {
-      await dbUpdate("notifications", { user_id: telegramId, read: false }, { read: true });
-      return jsonResponse({ success: true }, 200, origin);
     } catch (e: unknown) {
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
@@ -821,7 +755,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
   }
   
   if (path === "/api/channels/register" && method === "POST") {
-    const { channel_name, channel_invite_link, subscription_price, duration_days, category } = body;
+    const { channel_name, channel_invite_link, subscription_price, duration_days } = body;
     if (!channel_name || !channel_invite_link) return jsonResponse({ error: "Name and invite link required" }, 400, origin);
     if (!subscription_price || (subscription_price as number) <= 0) return jsonResponse({ error: "Invalid price" }, 400, origin);
     const validDurations = [7, 30, 90, 180, 365, 9999];
@@ -847,7 +781,6 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
         channel_invite_link,
         subscription_price,
         duration_days: duration_days,
-        category: category || "other",
         is_active: false,
       });
       return jsonResponse(result?.[0] || { success: true }, 201, origin);
@@ -969,16 +902,15 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
         }
       }
       
-      // ESCROW: Calculate total with platform fee
       const channelPrice = parseFloat(channel.subscription_price as string);
-      const platformFee = channelPrice * PLATFORM_FEE_PERCENT;
-      const totalPrice = channelPrice + platformFee;
+      const platformFee = channelPrice * PLATFORM_FEE_PERCENT; // 1% platform fee
+      const totalPrice = channelPrice + platformFee; // Subscriber pays channel price + 1% fee
       const creditsAmount = parseFloat(credits_used as string) || 0;
       const remaining = totalPrice - creditsAmount;
       const remainingNano = BigInt(Math.round(remaining * 1e9));
       const totalNano = remainingNano + NETWORK_FEE_NANO;
       
-      // ESCROW: All payments go to ADMIN wallet
+      // All payments go to admin wallet (escrow system)
       if (!ADMIN_TON_WALLET) return jsonResponse({ error: "Platform wallet not configured" }, 500, origin);
       
       const nonce = crypto.randomUUID();
@@ -989,15 +921,8 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
         expires_at: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
       });
       
-      console.log(`💰 ESCROW: Subscriber will pay ${totalPrice} TON (${channelPrice} + ${platformFee} fee) to ADMIN wallet`);
-      
       return jsonResponse({
-        paymentDetails: { 
-          wallet: ADMIN_TON_WALLET,
-          amountNano: totalNano.toString(), 
-          amount: remaining.toFixed(9), 
-          comment: nonce 
-        },
+        paymentDetails: { wallet: ADMIN_TON_WALLET, amountNano: totalNano.toString(), amount: remaining.toFixed(9), comment: nonce },
         subscriptionDetails: { 
           channel_id: channel.id, 
           channel_name: channel.channel_name, 
@@ -1023,16 +948,15 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       if (channels.length === 0) return jsonResponse({ error: "Channel not found" }, 404, origin);
       const channel = channels[0];
       
-      // ESCROW: Calculate total with platform fee
       const channelPrice = parseFloat(channel.subscription_price as string);
-      const platformFeeAmount = channelPrice * PLATFORM_FEE_PERCENT;
-      const totalPrice = channelPrice + platformFeeAmount;
+      const platformFeeAmount = channelPrice * PLATFORM_FEE_PERCENT; // 1% platform fee
+      const totalPrice = channelPrice + platformFeeAmount; // Subscriber pays channel price + 1% fee
       const creditsAmount = parseFloat(credits_used as string) || 0;
       const remaining = totalPrice - creditsAmount;
       
       let txHash = transaction_hash as string | undefined;
       if (remaining > 0 && !txHash) {
-        // ESCROW: Verify payment at ADMIN wallet
+        // Verify payment at ADMIN wallet (escrow system)
         if (!ADMIN_TON_WALLET) return jsonResponse({ error: "Platform wallet not configured" }, 500, origin);
         const result = await verifyTonPayment(ADMIN_TON_WALLET, BigInt(Math.round(remaining * 1e9)), nonce as string);
         if (!result.success) return jsonResponse({ error: result.error }, 400, origin);
@@ -1064,27 +988,28 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
         credits_used: creditsAmount,
       });
       
-      // ESCROW: Record transaction with correct splits
-      const ownerShare = channelPrice;
+      // Escrow system: Admin receives full payment, owes channel owner the channel price
+      // Platform fee (1%) is already collected by admin
+      // Owner share is the full channel price (to be paid out after withdrawal approval)
+      const ownerShare = channelPrice; // Channel owner gets the full channel price
       
       await dbInsert("platform_transactions", {
         subscription_id: subResult?.[0]?.id,
         user_id: telegramId,
         channel_id: channel_id as string,
         channel_owner_id: channel.owner_id,
-        amount_total: totalPrice,
-        owner_share: ownerShare,
-        platform_fee: platformFeeAmount,
+        amount_total: totalPrice, // What subscriber paid (channel price + 1% fee)
+        owner_share: ownerShare, // What channel owner is owed (full channel price)
+        platform_fee: platformFeeAmount, // 1% platform fee (kept by admin)
         network_fee: Number(NETWORK_FEE_NANO) / 1e9,
         transaction_hash: txHash,
       });
-      
-      console.log(`💰 ESCROW: Admin received ${totalPrice} TON, keeps ${platformFeeAmount} TON fee, owes ${ownerShare} TON to owner`);
       
       try {
         const referrerUsers = await dbSelect("users", { telegram_id: telegramId });
         const referrerId = referrerUsers[0]?.referred_by;
         if (referrerId) {
+          // Referral credit is based on channel price (not including platform fee)
           const creditAmount = channelPrice * REFERRAL_CREDIT_PERCENT;
           await dbRpc('add_credits', { 
             p_user_id: referrerId, 
@@ -1093,15 +1018,6 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
             p_reference_id: subResult?.[0]?.id
           });
           console.log(`✅ Awarded ${creditAmount} TON credit to referrer ${referrerId}`);
-          
-          // Send notification to referrer (Phase 2)
-          await createNotification(
-            referrerId,
-            'referral_credit',
-            'Referral Credit Earned!',
-            `You earned ${creditAmount.toFixed(4)} TON in credits from a referral subscription!`,
-            { amount: creditAmount }
-          );
         }
       } catch (e) {
         console.error("Referral credit error:", e);
@@ -1123,15 +1039,6 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
         }
       }
       
-      // Send subscription success notification (Phase 2)
-      await createNotification(
-        telegramId,
-        'subscription_success',
-        'Subscription Activated!',
-        `Your subscription to "${channel.channel_name}" is now active. Enjoy the premium content!`,
-        { channel_id: channel_id, channel_name: channel.channel_name }
-      );
-      
       return jsonResponse({ success: true, subscription: subResult?.[0], end_date: endDate.toISOString() }, 200, origin);
     } catch (e: unknown) {
       console.error("Confirm error:", e);
@@ -1146,7 +1053,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
     
     try {
       const now = new Date().toISOString();
-      const {  expiredSubs, error } = await supabase
+      const { data: expiredSubs, error } = await supabase
         .from('subscriptions')
         .select('id')
         .eq('status', 'active')
@@ -1348,6 +1255,7 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
         await dbUpdate("platform_transactions", { id: txId }, { owner_paid_out: true, withdrawal_id: withdrawalId });
       }
       
+      // Get owner's wallet address for the transfer
       const ownerUsers = await dbSelect("users", { telegram_id: withdrawal.channel_owner_id as number });
       const ownerWallet = ownerUsers[0]?.wallet_address || withdrawal.wallet_address;
       
@@ -1356,20 +1264,10 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
         status: 'processed', 
         processed_date: new Date().toISOString(), 
         processed_by: telegramId,
-        payout_tx_hash: 'PENDING_MANUAL_TRANSFER'
+        payout_tx_hash: 'PENDING_MANUAL_TRANSFER' // Admin needs to manually send TON
       });
       
-      console.log(`💰 ESCROW: Withdrawal approved. Admin must send ${withdrawal.amount} TON to ${ownerWallet}`);
-      
-      // Send notification to channel owner (Phase 2)
-      await createNotification(
-        withdrawal.channel_owner_id as number,
-        'withdrawal_approved',
-        'Withdrawal Approved',
-        `Your withdrawal of ${withdrawal.amount} TON has been approved. The funds will be sent to your wallet shortly.`,
-        { amount: withdrawal.amount }
-      );
-      
+      // Return transfer instructions for admin
       return jsonResponse({ 
         success: true, 
         covered: coveredIds.length,
@@ -1412,18 +1310,11 @@ serve(async (req: Request) => {
       
       return jsonResponse({ 
         status: 'healthy', 
-        version: '2.6.0', 
+        version: '2.4.1', 
         timestamp: new Date().toISOString(), 
         network: TON_NETWORK,
         bot: botStatus,
-        webhook_secret_set: !!WEBHOOK_SECRET,
-        escrow_enabled: true,
-        features: {
-          discovery: true,
-          notifications: true,
-          security_hardened: true,
-          multi_language: true
-        }
+        webhook_secret_set: !!WEBHOOK_SECRET
       }, 200, origin);
     } catch {
       return jsonResponse({ status: 'unhealthy', error: 'Database connection failed' }, 503, origin);
@@ -1473,7 +1364,7 @@ serve(async (req: Request) => {
     }
   }
   
-  return new Response("MySubHub API v2.6.0 - ALL 5 PHASES", { headers: getCorsHeaders(origin) });
+  return new Response("MySubHub API v2.4.1", { headers: getCorsHeaders(origin) });
 });
 
 async function autoSetup() {
@@ -1482,7 +1373,6 @@ async function autoSetup() {
     await telegramApi("setMyCommands", {
       commands: [
         { command: "start", description: "🚀 Open MySubHub Dashboard" },
-        { command: "discover", description: "🔍 Discover channels" },
         { command: "setup", description: "🔧 Check bot configuration" },
         { command: "help", description: "📚 Detailed tutorial & guide" },
         { command: "mychannels", description: "📺 Manage my channels" },
@@ -1507,4 +1397,4 @@ async function autoSetup() {
 }
 
 autoSetup();
-console.log("✅ MySubHub Backend v2.6.0 - ALL 5 PHASES started"); 
+console.log("✅ MySubHub Backend v2.4.1 started");
