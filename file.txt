@@ -1,9 +1,10 @@
-// MySubHub Backend v2.4.1 - COMPLETE WITH ALL FIXES
+// MySubHub Backend v2.5.1 - PAYMENT AND ESCROW HARDENING
 // Fixed: Edit channel price, admin channels tab visibility, forward button, expiration cron
 // Deploy this to Supabase Edge Functions
 
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { Address, beginCell } from "https://esm.sh/@ton/core@0.59.0";
 
 // ================== CONFIG ==================
 const BOT_TOKEN = Deno.env.get("BOT_TOKEN");
@@ -11,11 +12,15 @@ const ADMIN_TELEGRAM_ID = Deno.env.get("ADMIN_TELEGRAM_ID");
 const ADMIN_TON_WALLET = Deno.env.get("ADMIN_TON_WALLET");
 const TONCENTER_API_KEY = Deno.env.get("TONCENTER_API_KEY");
 const WEBHOOK_SECRET = Deno.env.get("WEBHOOK_SECRET");
+const CRON_SECRET = Deno.env.get("CRON_SECRET");
 const WEBAPP_URL = Deno.env.get("WEBAPP_URL") || "https://haman-hub.github.io/MySubHub-frontend";
-const TON_NETWORK = Deno.env.get("TON_NETWORK") || "testnet"; // FIXED: Default to mainnet
+const TON_NETWORK = (Deno.env.get("TON_NETWORK") || "testnet").trim().toLowerCase(); // Use testnet by default; set mainnet explicitly for production.
+if (TON_NETWORK !== "testnet" && TON_NETWORK !== "mainnet") {
+  throw new Error(`Invalid TON_NETWORK "${TON_NETWORK}". Set it to "testnet" or "mainnet".`);
+}
 const REFERRAL_CREDIT_PERCENT = 0.10;
 
-console.log(`🚀 Starting MySubHub Backend v2.4.1`);
+console.log(`🚀 Starting MySubHub Backend v2.5.1 - PAYMENT/ESCROW HARDENING`);
 console.log(`📡 TON_NETWORK: ${TON_NETWORK}`);
 
 if (!BOT_TOKEN || !ADMIN_TELEGRAM_ID || !ADMIN_TON_WALLET) {
@@ -29,7 +34,6 @@ const TONCENTER_BASE = TON_NETWORK === "testnet"
   ? "https://testnet.toncenter.com/api/v2"
   : "https://toncenter.com/api/v2";
 
-const NETWORK_FEE_NANO = 50_000_000n;
 const PLATFORM_FEE_PERCENT = 0.01;
 const MIN_WITHDRAWAL = 1.0;
 
@@ -112,14 +116,15 @@ function generateReferralCode(): string {
 const ALLOWED_ORIGINS = ["https://haman-hub.github.io", "https://web.telegram.org", "https://t.me"];
 
 function getCorsHeaders(origin: string | null) {
-  const allowed = origin && ALLOWED_ORIGINS.some(o => origin.startsWith(o)) ? origin : ALLOWED_ORIGINS[0];
-  return {
-    "Access-Control-Allow-Origin": allowed,
+  const headers: Record<string, string> = {
     "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, x-telegram-initdata, Authorization",
+    "Access-Control-Allow-Headers": "Content-Type, x-telegram-initdata, Authorization, x-cron-secret",
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin",
   };
+  // Exact origin matching avoids trusting hostile look-alike origins.
+  if (origin && ALLOWED_ORIGINS.includes(origin)) headers["Access-Control-Allow-Origin"] = origin;
+  return headers;
 }
 
 function jsonResponse(payload: unknown, status = 200, origin: string | null = null) {
@@ -172,7 +177,7 @@ async function validateInitData(initData: string): Promise<Record<string, unknow
     const params = new URLSearchParams(initData);
     const authDate = parseInt(params.get("auth_date") || "0", 10);
     const now = Math.floor(Date.now() / 1000);
-    if (!authDate || now - authDate > 86400) return null;
+    if (!Number.isFinite(authDate) || authDate <= 0 || authDate > now + 30 || now - authDate > 86400) return null;
 
     const secretKey = await crypto.subtle.importKey(
       "raw", new TextEncoder().encode("WebAppData"),
@@ -211,34 +216,122 @@ function verifyWebhookSecret(headers: Headers): boolean {
 }
 
 // ================== TON PAYMENT VERIFICATION ==================
-async function verifyTonPayment(walletAddress: string, expectedAmountNano: bigint, comment?: string) {
+function normalizeTonAddress(value: string): string {
   try {
-    const txRes = await fetch(`${TONCENTER_BASE}/getTransactions?address=${walletAddress}&limit=50`, {
-      headers: { "X-API-Key": TONCENTER_API_KEY || "" }
-    });
-    const txData = await txRes.json();
-    if (!txData.ok || !txData.result) return { success: false, error: "Failed to fetch transactions" };
+    return Address.parse(value).toRawString().toLowerCase();
+  } catch {
+    return String(value || "").trim().toLowerCase();
+  }
+}
 
-    const cutoff = Math.floor(Date.now() / 1000) - 600;
-    for (const tx of txData.result) {
-      if (tx.utime < cutoff) continue;
-      const inMsg = tx.in_msg;
-      if (!inMsg?.value) continue;
-      try {
-        const received = BigInt(inMsg.value);
-        if (received >= expectedAmountNano) {
-          if (comment && inMsg.message !== comment) continue;
-          const txHash = tx.transaction_id?.hash;
-          if (!txHash) continue;
-          const existing = await dbSelect("subscriptions", { transaction_hash: txHash });
-          if (existing.length > 0) continue;
-          return { success: true, txHash };
-        }
-      } catch { continue; }
+function makeTonCommentPayload(comment: string): string {
+  // TON text-comment payload: uint32 opcode 0 followed by UTF-8 text.
+  const cell = beginCell().storeUint(0, 32).storeStringTail(comment).endCell();
+  const boc = new Uint8Array(cell.toBoc() as Uint8Array);
+  return btoa(Array.from(boc, (byte: number) => String.fromCharCode(byte)).join(""));
+}
+
+async function verifyTonPayment(
+  walletAddress: string,
+  expectedAmountNano: bigint,
+  comment: string,
+  createdAfter: number,
+): Promise<{ success: boolean; txHash?: string; error?: string }> {
+  try {
+    if (!TONCENTER_API_KEY) return { success: false, error: "TON Center API key is not configured" };
+    if (expectedAmountNano <= 0n) return { success: false, error: "Invalid expected amount" };
+
+    const endpoint = new URL(`${TONCENTER_BASE}/getTransactions`);
+    endpoint.searchParams.set("address", walletAddress);
+    endpoint.searchParams.set("limit", "100");
+    const response = await fetch(endpoint.toString(), {
+      headers: { "X-API-Key": TONCENTER_API_KEY },
+    });
+    if (!response.ok) return { success: false, error: "TON Center transaction lookup failed" };
+
+    const data = await response.json();
+    if (!data?.ok || !Array.isArray(data.result)) {
+      return { success: false, error: "TON Center returned an invalid transaction response" };
     }
-    return { success: false, error: "No matching transaction found" };
+
+    const expectedDestination = normalizeTonAddress(walletAddress);
+    for (const tx of data.result) {
+      if (!tx?.utime || Number(tx.utime) < createdAfter) continue;
+      if (tx.aborted === true || tx.description?.aborted === true ||
+          tx.compute_phase?.success === false || tx.action_phase?.success === false) continue;
+
+      const incoming = tx.in_msg;
+      if (!incoming?.value || !incoming?.destination || typeof incoming.message !== "string") continue;
+      if (incoming.bounced === true) continue;
+      if (normalizeTonAddress(String(incoming.destination)) !== expectedDestination) continue;
+
+      let receivedNano: bigint;
+      try { receivedNano = BigInt(String(incoming.value)); } catch { continue; }
+
+      // Exact amount + per-intent comment prevents amount-only matching and basic replay.
+      if (receivedNano !== expectedAmountNano || incoming.message !== comment) continue;
+
+      const txHash = tx.transaction_id?.hash;
+      if (!txHash || typeof txHash !== "string") continue;
+      const duplicate = await dbSelect("subscriptions", { transaction_hash: txHash });
+      if (duplicate.length > 0) continue;
+
+      return { success: true, txHash };
+    }
+    return {
+      success: false,
+      error: "No confirmed transfer matching recipient, exact amount and payment reference was found",
+    };
   } catch (e: unknown) {
-    return { success: false, error: `Verification error: ${e instanceof Error ? e.message : 'Unknown'}` };
+    return {
+      success: false,
+      error: `Payment verification error: ${e instanceof Error ? e.message : "Unknown"}`,
+    };
+  }
+}
+
+async function verifyTonPayout(
+  transactionHash: string,
+  destination: string,
+  expectedAmountNano: bigint,
+  approvedAfter: number,
+): Promise<boolean> {
+  try {
+    if (!TONCENTER_API_KEY || !ADMIN_TON_WALLET || !transactionHash) return false;
+
+    const endpoint = new URL(`${TONCENTER_BASE}/getTransactions`);
+    endpoint.searchParams.set("address", ADMIN_TON_WALLET);
+    endpoint.searchParams.set("limit", "100");
+    const response = await fetch(endpoint.toString(), {
+      headers: { "X-API-Key": TONCENTER_API_KEY },
+    });
+    if (!response.ok) return false;
+
+    const data = await response.json();
+    if (!data?.ok || !Array.isArray(data.result)) return false;
+    const expectedDestination = normalizeTonAddress(destination);
+
+    for (const tx of data.result) {
+      if (tx?.transaction_id?.hash !== transactionHash) continue;
+      if (Number(tx.utime || 0) < approvedAfter || tx.aborted === true ||
+          tx.description?.aborted === true || tx.compute_phase?.success === false ||
+          tx.action_phase?.success === false) return false;
+
+      for (const outgoing of (tx.out_msgs || [])) {
+        if (!outgoing?.destination || !outgoing?.value) continue;
+        if (normalizeTonAddress(String(outgoing.destination)) !== expectedDestination) continue;
+        try {
+          if (BigInt(String(outgoing.value)) === expectedAmountNano) return true;
+        } catch {
+          // Ignore malformed message values.
+        }
+      }
+      return false;
+    }
+    return false;
+  } catch (e) {
+    console.error("Payout verification error:", e);
+    return false;
   }
 }
 
@@ -589,11 +682,16 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
   
   if (path === "/api/auth/wallet" && method === "POST") {
     const { wallet_address } = body;
-    if (!wallet_address || typeof wallet_address !== 'string') {
+    if (!wallet_address || typeof wallet_address !== "string" || wallet_address.length > 128) {
       return jsonResponse({ error: "Invalid wallet address" }, 400, origin);
     }
-    await dbUpdate("users", { telegram_id: telegramId }, { wallet_address });
-    return jsonResponse({ success: true }, 200, origin);
+    try {
+      const canonical = Address.parse(wallet_address).toString({ urlSafe: true, bounceable: false });
+      await dbUpdate("users", { telegram_id: telegramId }, { wallet_address: canonical });
+      return jsonResponse({ success: true, wallet_address: canonical }, 200, origin);
+    } catch {
+      return jsonResponse({ error: "Invalid TON wallet address" }, 400, origin);
+    }
   }
   
   // ================== CHANNEL DISCOVERY (PUBLIC) ==================
@@ -880,176 +978,249 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
   
   if (path === "/api/subscriptions/initiate" && method === "POST") {
     const { channel_id, credits_used = 0 } = body;
-    if (!channel_id || !isValidUUID(channel_id as string)) return jsonResponse({ error: "Invalid channel ID" }, 400, origin);
+    if (!channel_id || !isValidUUID(channel_id as string)) {
+      return jsonResponse({ error: "Invalid channel ID" }, 400, origin);
+    }
+
+    const parsedCredits = Number(credits_used);
+    if (!Number.isFinite(parsedCredits) || parsedCredits < 0) {
+      return jsonResponse({ error: "Invalid credit amount" }, 400, origin);
+    }
+    const creditsRequested = Number(parsedCredits.toFixed(9));
+
     try {
       const channels = await dbSelect("channels", { id: channel_id as string, is_active: true });
       if (channels.length === 0) return jsonResponse({ error: "Channel not found" }, 404, origin);
       const channel = channels[0];
-      
+
       const ownerUsers = await dbSelect("users", { telegram_id: channel.owner_id as number });
       if (ownerUsers.length > 0 && ownerUsers[0].is_banned) {
         return jsonResponse({ error: "This channel is unavailable" }, 403, origin);
       }
-      
+
       const existing = await dbSelect("subscriptions", { user_id: telegramId, channel_id: channel_id as string });
-      
-      if (existing.length > 0) {
-        const latestSub = existing.sort((a, b) => new Date(b.created_at as string).getTime() - new Date(a.created_at as string).getTime())[0];
-        const endDate = new Date(latestSub.end_date as string);
-        
-        if (latestSub.status === 'active' && endDate > new Date()) {
-          return jsonResponse({ error: "Already subscribed" }, 400, origin);
-        }
+      if (existing.some((sub: Record<string, unknown>) =>
+        sub.status === "active" && new Date(String(sub.end_date)) > new Date())) {
+        return jsonResponse({ error: "Already subscribed" }, 400, origin);
       }
-      
-      const channelPrice = parseFloat(channel.subscription_price as string);
-      const platformFee = channelPrice * PLATFORM_FEE_PERCENT; // 1% platform fee
-      const totalPrice = channelPrice + platformFee; // Subscriber pays channel price + 1% fee
-      const creditsAmount = parseFloat(credits_used as string) || 0;
-      const remaining = totalPrice - creditsAmount;
-      const remainingNano = BigInt(Math.round(remaining * 1e9));
-      const totalNano = remainingNano + NETWORK_FEE_NANO;
-      
-      // All payments go to admin wallet (escrow system)
-      if (!ADMIN_TON_WALLET) return jsonResponse({ error: "Platform wallet not configured" }, 500, origin);
-      
+
+      // Allow one unexpired checkout per Telegram user. This prevents two tabs from
+      // spending the same referral-credit balance against different payment intents.
+      const activeIntents = await dbSelect("payment_nonces", {
+        user_id: telegramId, used: false,
+      });
+      const nowMs = Date.now();
+      const activeIntent = activeIntents.find((intent: Record<string, unknown>) =>
+        Date.parse(String(intent.expires_at || "")) > nowMs);
+      if (activeIntent) {
+        const sameChannel = String(activeIntent.channel_id) === String(channel_id);
+        return jsonResponse({
+          error: sameChannel
+            ? "A checkout is already pending for this channel. Finish it or wait for the payment reference to expire."
+            : "You already have another checkout pending. Finish it or wait for its payment reference to expire.",
+        }, 409, origin);
+      }
+
+      const channelPrice = Number(Number(channel.subscription_price).toFixed(9));
+      const platformFee = Number((channelPrice * PLATFORM_FEE_PERCENT).toFixed(9));
+      const totalPrice = Number((channelPrice + platformFee).toFixed(9));
+      if (!Number.isFinite(channelPrice) || channelPrice <= 0 || !Number.isFinite(totalPrice)) {
+        return jsonResponse({ error: "Invalid channel price" }, 400, origin);
+      }
+      if (creditsRequested > totalPrice + 1e-9) {
+        return jsonResponse({ error: "Credits cannot exceed the subscription total" }, 400, origin);
+      }
+
+      const creditRows = creditsRequested > 0
+        ? await dbSelect("referral_credits", { user_id: telegramId })
+        : [];
+      const availableCredits = creditRows.reduce(
+        (sum: number, row: Record<string, unknown>) => sum + Math.max(0, Number(row.balance || 0)),
+        0,
+      );
+      if (creditsRequested > availableCredits + 1e-9) {
+        return jsonResponse({ error: "Insufficient referral credits" }, 400, origin);
+      }
+      if (!ADMIN_TON_WALLET) {
+        return jsonResponse({ error: "Platform wallet is not configured" }, 500, origin);
+      }
+
+      // Network fees are paid separately by the sender's wallet. Do not add a fixed
+      // 0.05 TON surcharge to the amount delivered to the escrow wallet.
+      const amountRemaining = Number(Math.max(0, totalPrice - creditsRequested).toFixed(9));
+      const amountNano = BigInt(Math.round(amountRemaining * 1e9));
+      let recipientAddress: string;
+      try {
+        recipientAddress = Address.parse(ADMIN_TON_WALLET).toString({ urlSafe: true, bounceable: false });
+      } catch {
+        return jsonResponse({ error: "Platform wallet address is invalid" }, 500, origin);
+      }
+
       const nonce = crypto.randomUUID();
+      const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+      const payload = makeTonCommentPayload(nonce);
+
       await dbInsert("payment_nonces", {
         user_id: telegramId,
         channel_id: channel_id as string,
         nonce,
-        expires_at: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+        expires_at: expiresAt,
+        used: false,
+        credits_used: creditsRequested,
+        expected_total: totalPrice,
+        channel_price: channelPrice,
+        platform_fee: platformFee,
+        duration_days: Number(channel.duration_days),
+        expected_amount_nano: amountNano.toString(),
       });
-      
+
       return jsonResponse({
-        paymentDetails: { wallet: ADMIN_TON_WALLET, amountNano: totalNano.toString(), amount: remaining.toFixed(9), comment: nonce },
-        subscriptionDetails: { 
-          channel_id: channel.id, 
-          channel_name: channel.channel_name, 
+        paymentDetails: {
+          wallet: recipientAddress,
+          amountNano: amountNano.toString(),
+          amount: amountRemaining.toFixed(9),
+          comment: nonce,
+          payload,
+          network: TON_NETWORK === "testnet" ? "-3" : "-239",
+        },
+        subscriptionDetails: {
+          channel_id: channel.id,
+          channel_name: channel.channel_name,
           channel_price: channelPrice,
           platform_fee: platformFee,
           total_price: totalPrice,
-          credits_used: creditsAmount, 
-          remaining, 
-          duration_days: channel.duration_days 
+          credits_used: creditsRequested,
+          remaining: amountRemaining,
+          duration_days: channel.duration_days,
         },
         nonce,
+        expires_at: expiresAt,
       }, 200, origin);
     } catch (e: unknown) {
-      return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
+      console.error("Payment initiation error:", e);
+      return jsonResponse({ error: e instanceof Error ? e.message : "Failed" }, 500, origin);
     }
   }
-  
+
   if (path === "/api/subscriptions/confirm" && method === "POST") {
-    const { channel_id, transaction_hash, credits_used = 0, nonce } = body;
-    if (!channel_id || !isValidUUID(channel_id as string)) return jsonResponse({ error: "Invalid channel ID" }, 400, origin);
+    const { channel_id, nonce } = body;
+    if (!channel_id || !isValidUUID(channel_id as string)) {
+      return jsonResponse({ error: "Invalid channel ID" }, 400, origin);
+    }
+    if (typeof nonce !== "string" || nonce.length < 16 || nonce.length > 100) {
+      return jsonResponse({ error: "Invalid payment reference" }, 400, origin);
+    }
+
     try {
-      const channels = await dbSelect("channels", { id: channel_id as string, is_active: true });
-      if (channels.length === 0) return jsonResponse({ error: "Channel not found" }, 404, origin);
-      const channel = channels[0];
-      
-      const channelPrice = parseFloat(channel.subscription_price as string);
-      const platformFeeAmount = channelPrice * PLATFORM_FEE_PERCENT; // 1% platform fee
-      const totalPrice = channelPrice + platformFeeAmount; // Subscriber pays channel price + 1% fee
-      const creditsAmount = parseFloat(credits_used as string) || 0;
-      const remaining = totalPrice - creditsAmount;
-      
-      let txHash = transaction_hash as string | undefined;
-      if (remaining > 0 && !txHash) {
-        // Verify payment at ADMIN wallet (escrow system)
-        if (!ADMIN_TON_WALLET) return jsonResponse({ error: "Platform wallet not configured" }, 500, origin);
-        const result = await verifyTonPayment(ADMIN_TON_WALLET, BigInt(Math.round(remaining * 1e9)), nonce as string);
-        if (!result.success) return jsonResponse({ error: result.error }, 400, origin);
-        txHash = result.txHash;
-      }
-      if (!txHash) return jsonResponse({ error: "No valid transaction" }, 400, origin);
-      
-      const dup = await dbSelect("subscriptions", { transaction_hash: txHash });
-      if (dup.length > 0) return jsonResponse({ error: "Transaction already processed" }, 409, origin);
-      
-      if (creditsAmount > 0) {
-        try {
-          const success = await dbRpc('deduct_credits', { p_user_id: telegramId, p_amount: creditsAmount });
-          if (!success) return jsonResponse({ error: "Insufficient credits" }, 400, origin);
-        } catch (e) {
-          return jsonResponse({ error: "Credit deduction failed" }, 500, origin);
+      const intents = await dbSelect("payment_nonces", {
+        nonce,
+        user_id: telegramId,
+        channel_id: channel_id as string,
+      });
+      const intent = intents[0] as Record<string, unknown> | undefined;
+      if (!intent) return jsonResponse({ error: "Payment intent not found" }, 404, origin);
+
+      if (intent.used === true) {
+        const alreadyCompleted = await dbSelect("subscriptions", {
+          payment_nonce: nonce,
+          user_id: telegramId,
+        });
+        if (alreadyCompleted.length > 0) {
+          return jsonResponse({
+            success: true,
+            subscription: alreadyCompleted[0],
+            end_date: alreadyCompleted[0].end_date,
+            idempotent: true,
+          }, 200, origin);
         }
+        return jsonResponse({ error: "Payment reference has already been used" }, 409, origin);
       }
-      
-      const endDate = new Date();
-      endDate.setDate(endDate.getDate() + (channel.duration_days as number));
-      const subResult = await dbInsert("subscriptions", {
-        user_id: telegramId,
-        channel_id: channel_id as string,
-        end_date: endDate.toISOString(),
-        transaction_hash: txHash,
-        amount: totalPrice,
-        status: 'active',
-        credits_used: creditsAmount,
-      });
-      
-      // Escrow system: Admin receives full payment, owes channel owner the channel price
-      // Platform fee (1%) is already collected by admin
-      // Owner share is the full channel price (to be paid out after withdrawal approval)
-      const ownerShare = channelPrice; // Channel owner gets the full channel price
-      
-      await dbInsert("platform_transactions", {
-        subscription_id: subResult?.[0]?.id,
-        user_id: telegramId,
-        channel_id: channel_id as string,
-        channel_owner_id: channel.owner_id,
-        amount_total: totalPrice, // What subscriber paid (channel price + 1% fee)
-        owner_share: ownerShare, // What channel owner is owed (full channel price)
-        platform_fee: platformFeeAmount, // 1% platform fee (kept by admin)
-        network_fee: Number(NETWORK_FEE_NANO) / 1e9,
-        transaction_hash: txHash,
-      });
-      
+
+      const expiresAt = Date.parse(String(intent.expires_at || ""));
+      if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+        return jsonResponse({ error: "Payment reference expired. Start checkout again." }, 410, origin);
+      }
+
+      const channels = await dbSelect("channels", { id: channel_id as string, is_active: true });
+      if (channels.length === 0) return jsonResponse({ error: "Channel is unavailable" }, 404, origin);
+
+      const expectedNano = BigInt(String(intent.expected_amount_nano || "0"));
+      let transactionHash: string | null = null;
+      if (expectedNano > 0n) {
+        if (!ADMIN_TON_WALLET) return jsonResponse({ error: "Platform wallet is not configured" }, 500, origin);
+        const createdAtMs = Date.parse(String(intent.created_at || "")) || (Date.now() - 15 * 60 * 1000);
+        const verification = await verifyTonPayment(
+          ADMIN_TON_WALLET,
+          expectedNano,
+          nonce,
+          Math.floor(createdAtMs / 1000) - 30,
+        );
+        if (!verification.success || !verification.txHash) {
+          return jsonResponse({
+            error: verification.error || "Payment is not yet visible on-chain. Retry verification shortly.",
+            pending: true,
+          }, 402, origin);
+        }
+        transactionHash = verification.txHash;
+      }
+
+      const result = await dbRpc("complete_subscription_payment", {
+        p_nonce: nonce,
+        p_user_id: telegramId,
+        p_transaction_hash: transactionHash,
+      }) as Record<string, unknown>;
+
+      const subscription = result?.subscription as Record<string, unknown> | undefined;
+      if (!result?.success || !subscription) {
+        throw new Error("Atomic payment completion did not return a subscription");
+      }
+
+      // Referral reward is best-effort; the payment/subscription/ledger transaction is already committed.
       try {
-        const referrerUsers = await dbSelect("users", { telegram_id: telegramId });
-        const referrerId = referrerUsers[0]?.referred_by;
+        const userRows = await dbSelect("users", { telegram_id: telegramId });
+        const referrerId = userRows[0]?.referred_by;
         if (referrerId) {
-          // Referral credit is based on channel price (not including platform fee)
-          const creditAmount = channelPrice * REFERRAL_CREDIT_PERCENT;
-          await dbRpc('add_credits', { 
-            p_user_id: referrerId, 
-            p_amount: creditAmount,
-            p_description: `Referral credit from subscription`,
-            p_reference_id: subResult?.[0]?.id
+          const channelPrice = Number(intent.channel_price || channels[0].subscription_price);
+          await dbRpc("add_credits", {
+            p_user_id: referrerId,
+            p_amount: Number((channelPrice * REFERRAL_CREDIT_PERCENT).toFixed(9)),
+            p_description: "Referral credit from subscription",
+            p_reference_id: subscription.id,
           });
-          console.log(`✅ Awarded ${creditAmount} TON credit to referrer ${referrerId}`);
         }
       } catch (e) {
         console.error("Referral credit error:", e);
       }
-      
-      if (nonce) {
-        await dbUpdate("payment_nonces", { nonce: nonce as string }, { used: true }).catch(() => {});
-      }
-      
+
+      const channel = channels[0];
       if (channel.channel_chat_id) {
         try {
           await telegramApi("unbanChatMember", {
             chat_id: channel.channel_chat_id,
             user_id: telegramId,
-            only_if_banned: true
+            only_if_banned: true,
           });
         } catch (e) {
-          console.error("Failed to unban user:", e);
+          console.error("Failed to restore subscriber access:", e);
         }
       }
-      
-      return jsonResponse({ success: true, subscription: subResult?.[0], end_date: endDate.toISOString() }, 200, origin);
+
+      return jsonResponse({ success: true, subscription, end_date: subscription.end_date }, 200, origin);
     } catch (e: unknown) {
-      console.error("Confirm error:", e);
-      return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
+      console.error("Subscription confirmation error:", e);
+      const message = e instanceof Error ? e.message : "Failed";
+      if (/already used|already processed|duplicate|already subscribed/i.test(message)) {
+        return jsonResponse({ error: message }, 409, origin);
+      }
+      if (/insufficient credits/i.test(message)) return jsonResponse({ error: message }, 400, origin);
+      return jsonResponse({
+        error: "Subscription confirmation failed. Check payment status before retrying.",
+      }, 500, origin);
     }
   }
-  
+
   if (path === "/api/cron/expire-subscriptions" && method === "POST") {
-    if (!isAdmin && !body.internal) {
-      return jsonResponse({ error: "Unauthorized" }, 403, origin);
-    }
+    if (!isAdmin) return jsonResponse({ error: "Unauthorized" }, 403, origin);
     
     try {
       const now = new Date().toISOString();
@@ -1108,36 +1279,58 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
   
   if (path === "/api/withdrawals/my" && method === "GET") {
     try {
-      const unpaid = await dbSelect("platform_transactions", { channel_owner_id: telegramId, owner_paid_out: false });
-      const pendingEarnings = unpaid.reduce((sum: number, r: Record<string, unknown>) => sum + parseFloat(r.owner_share as string || '0'), 0);
+      const unpaid = await dbSelect("platform_transactions", {
+        channel_owner_id: telegramId,
+        owner_paid_out: false,
+      });
+      const grossRemaining = unpaid.reduce((sum: number, row: Record<string, unknown>) =>
+        sum + Math.max(0, Number(row.owner_share || 0) - Number(row.paid_amount || 0)), 0);
       const withdrawals = await dbSelect("withdrawals", { channel_owner_id: telegramId });
-      return jsonResponse({ pendingEarnings, withdrawals }, 200, origin);
+      const activeWithdrawals = withdrawals.filter((row: Record<string, unknown>) =>
+        ["pending", "approved"].includes(String(row.status)));
+      const reserved = activeWithdrawals.reduce(
+        (sum: number, row: Record<string, unknown>) => sum + Number(row.amount || 0), 0
+      );
+
+      return jsonResponse({
+        // This project permits only one pending/approved withdrawal at a time.
+        pendingEarnings: Number((activeWithdrawals.length ? 0 : grossRemaining).toFixed(9)),
+        reservedWithdrawals: Number(reserved.toFixed(9)),
+        withdrawals,
+      }, 200, origin);
     } catch (e: unknown) {
-      return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
+      return jsonResponse({ error: e instanceof Error ? e.message : "Failed" }, 500, origin);
     }
   }
-  
+
   if (path === "/api/withdrawals/request" && method === "POST") {
-    const { amount, wallet_address } = body;
-    if (!amount || (amount as number) <= 0) return jsonResponse({ error: "Invalid amount" }, 400, origin);
-    if ((amount as number) < MIN_WITHDRAWAL) return jsonResponse({ error: `Minimum withdrawal is ${MIN_WITHDRAWAL} TON` }, 400, origin);
-    if (!wallet_address) return jsonResponse({ error: "Wallet address required" }, 400, origin);
+    const amount = Number(body.amount);
+    const walletAddress = typeof body.wallet_address === "string" ? body.wallet_address.trim() : "";
+    if (!Number.isFinite(amount) || amount < MIN_WITHDRAWAL) {
+      return jsonResponse({ error: `Minimum withdrawal is ${MIN_WITHDRAWAL} TON` }, 400, origin);
+    }
+    if (!walletAddress || walletAddress.length > 128) {
+      return jsonResponse({ error: "Valid wallet address required" }, 400, origin);
+    }
+
     try {
-      const pendingWithdrawals = await dbSelect("withdrawals", { channel_owner_id: telegramId, status: "pending" });
-      if (pendingWithdrawals.length > 0) {
-        return jsonResponse({ error: "You already have a pending withdrawal request. Please wait for it to be processed." }, 400, origin);
-      }
-      
-      const unpaid = await dbSelect("platform_transactions", { channel_owner_id: telegramId, owner_paid_out: false });
-      const total = unpaid.reduce((s: number, r: Record<string, unknown>) => s + parseFloat(r.owner_share as string || '0'), 0);
-      if ((amount as number) > total) return jsonResponse({ error: "Insufficient balance" }, 400, origin);
-      await dbInsert("withdrawals", { channel_owner_id: telegramId, amount, wallet_address, status: "pending" });
-      return jsonResponse({ success: true }, 200, origin);
+      const canonicalWallet = Address.parse(walletAddress).toString({ urlSafe: true, bounceable: false });
+      const withdrawal = await dbRpc("request_owner_withdrawal", {
+        p_owner_id: telegramId,
+        p_amount: Number(amount.toFixed(9)),
+        p_wallet_address: canonicalWallet,
+      });
+      return jsonResponse({ success: true, withdrawal }, 200, origin);
     } catch (e: unknown) {
-      return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
+      const message = e instanceof Error ? e.message : "Failed";
+      if (/insufficient balance|pending or approved withdrawal|already has a pending|minimum withdrawal/i.test(message)) {
+        return jsonResponse({ error: message }, 400, origin);
+      }
+      console.error("Withdrawal request error:", e);
+      return jsonResponse({ error: "Unable to reserve this withdrawal. Check your balance and wallet address." }, 500, origin);
     }
   }
-  
+
   if (path === "/api/reviews" && method === "POST") {
     const { channel_id, rating, comment } = body;
     if (!channel_id || !rating || (rating as number) < 1 || (rating as number) > 5) return jsonResponse({ error: "Invalid rating" }, 400, origin);
@@ -1228,61 +1421,95 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
   
   if (path === "/api/admin/withdrawals" && method === "GET") {
     try {
-      const withdrawals = await dbSelect("withdrawals", { status: 'pending' });
-      return jsonResponse(withdrawals, 200, origin);
+      const pending = await dbSelect("withdrawals", { status: "pending" });
+      const approved = await dbSelect("withdrawals", { status: "approved" });
+      return jsonResponse([...pending, ...approved], 200, origin);
     } catch (e: unknown) {
-      return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
+      return jsonResponse({ error: e instanceof Error ? e.message : "Failed" }, 500, origin);
     }
   }
-  
+
+  // Approval reserves funds but does not mark a payout as completed.
   if (path.match(/^\/api\/admin\/withdrawals\/[a-f0-9-]+\/approve$/) && method === "POST") {
     const withdrawalId = path.split("/")[4];
     if (!isValidUUID(withdrawalId)) return jsonResponse({ error: "Invalid withdrawal ID" }, 400, origin);
     try {
       const withdrawals = await dbSelect("withdrawals", { id: withdrawalId });
-      const withdrawal = withdrawals[0];
-      if (!withdrawal || withdrawal.status !== 'pending') return jsonResponse({ error: "Not found or processed" }, 404, origin);
-      
-      const unpaidTxs = await dbSelect("platform_transactions", { channel_owner_id: withdrawal.channel_owner_id as number, owner_paid_out: false });
-      let remaining = parseFloat(withdrawal.amount as string);
-      const coveredIds: string[] = [];
-      for (const tx of unpaidTxs) {
-        if (remaining <= 0) break;
-        coveredIds.push(tx.id as string);
-        remaining -= parseFloat(tx.owner_share as string);
+      const withdrawal = withdrawals[0] as Record<string, unknown> | undefined;
+      if (!withdrawal || withdrawal.status !== "pending") {
+        return jsonResponse({ error: "Withdrawal is not pending" }, 409, origin);
       }
-      for (const txId of coveredIds) {
-        await dbUpdate("platform_transactions", { id: txId }, { owner_paid_out: true, withdrawal_id: withdrawalId });
-      }
-      
-      // Get owner's wallet address for the transfer
-      const ownerUsers = await dbSelect("users", { telegram_id: withdrawal.channel_owner_id as number });
-      const ownerWallet = ownerUsers[0]?.wallet_address || withdrawal.wallet_address;
-      
-      await dbUpdate("withdrawals", { 
-        id: withdrawalId, 
-        status: 'processed', 
-        processed_date: new Date().toISOString(), 
-        processed_by: telegramId,
-        payout_tx_hash: 'PENDING_MANUAL_TRANSFER' // Admin needs to manually send TON
+      const wallet = String(withdrawal.wallet_address || "");
+      try { Address.parse(wallet); } catch { return jsonResponse({ error: "Invalid withdrawal wallet address" }, 400, origin); }
+
+      const updated = await dbUpdate("withdrawals", { id: withdrawalId, status: "pending" }, {
+        status: "approved",
+        approved_at: new Date().toISOString(),
+        approved_by: telegramId,
       });
-      
-      // Return transfer instructions for admin
-      return jsonResponse({ 
-        success: true, 
-        covered: coveredIds.length,
+      if (!updated.length) return jsonResponse({ error: "Withdrawal was already changed" }, 409, origin);
+
+      return jsonResponse({
+        success: true,
+        status: "approved",
         transfer_instructions: {
           from: ADMIN_TON_WALLET,
-          to: ownerWallet,
-          amount: parseFloat(withdrawal.amount as string),
-          note: "Admin must manually send this amount from platform wallet to channel owner's wallet"
-        }
+          to: wallet,
+          amount: Number(withdrawal.amount),
+          amount_nano: BigInt(Math.round(Number(withdrawal.amount) * 1e9)).toString(),
+          note: "Send this exact amount from the platform wallet, then submit the outgoing transaction hash to the complete endpoint. Approval alone does not mark funds as paid.",
+        },
       }, 200, origin);
     } catch (e: unknown) {
-      return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
+      console.error("Withdrawal approval error:", e);
+      return jsonResponse({ error: "Unable to approve withdrawal" }, 500, origin);
     }
   }
-  
+
+  if (path.match(/^\/api\/admin\/withdrawals\/[a-f0-9-]+\/complete$/) && method === "POST") {
+    const withdrawalId = path.split("/")[4];
+    const transactionHash = typeof body.transaction_hash === "string" ? body.transaction_hash.trim() : "";
+    if (!isValidUUID(withdrawalId)) return jsonResponse({ error: "Invalid withdrawal ID" }, 400, origin);
+    if (!transactionHash || transactionHash.length > 200) {
+      return jsonResponse({ error: "Outgoing transaction hash is required" }, 400, origin);
+    }
+
+    try {
+      const withdrawals = await dbSelect("withdrawals", { id: withdrawalId });
+      const withdrawal = withdrawals[0] as Record<string, unknown> | undefined;
+      if (!withdrawal) return jsonResponse({ error: "Withdrawal not found" }, 404, origin);
+      if (withdrawal.status === "processed" && withdrawal.payout_tx_hash === transactionHash) {
+        return jsonResponse({ success: true, withdrawal, idempotent: true }, 200, origin);
+      }
+      if (withdrawal.status !== "approved") {
+        return jsonResponse({ error: "Withdrawal must be approved before completion" }, 409, origin);
+      }
+
+      const wallet = String(withdrawal.wallet_address || "");
+      const amountNano = BigInt(Math.round(Number(withdrawal.amount) * 1e9));
+      const approvedAtMs = Date.parse(String(withdrawal.approved_at || withdrawal.request_date || "")) || 0;
+      const isVerified = await verifyTonPayout(
+        transactionHash,
+        wallet,
+        amountNano,
+        Math.floor(approvedAtMs / 1000) - 30,
+      );
+      if (!isVerified) {
+        return jsonResponse({ error: "Outgoing transaction not found or amount/recipient does not match" }, 400, origin);
+      }
+
+      const result = await dbRpc("complete_withdrawal", {
+        p_withdrawal_id: withdrawalId,
+        p_admin_id: telegramId,
+        p_transaction_hash: transactionHash,
+      });
+      return jsonResponse({ success: true, withdrawal: result }, 200, origin);
+    } catch (e: unknown) {
+      console.error("Withdrawal completion error:", e);
+      return jsonResponse({ error: "Unable to complete withdrawal. Verify the outgoing transaction and retry." }, 500, origin);
+    }
+  }
+
   return jsonResponse({ error: "Not found" }, 404, origin);
 }
 
@@ -1310,7 +1537,7 @@ serve(async (req: Request) => {
       
       return jsonResponse({ 
         status: 'healthy', 
-        version: '2.4.1', 
+        version: '2.5.1', 
         timestamp: new Date().toISOString(), 
         network: TON_NETWORK,
         bot: botStatus,
@@ -1321,10 +1548,38 @@ serve(async (req: Request) => {
     }
   }
   
+  if (path.endsWith("/api/cron/expire-subscriptions") && method === "POST") {
+    const suppliedSecret = req.headers.get("x-cron-secret") || "";
+    if (!CRON_SECRET || suppliedSecret !== CRON_SECRET) {
+      return jsonResponse({ error: "Unauthorized" }, 403, origin);
+    }
+    try {
+      const now = new Date().toISOString();
+      const { data: expiredSubs, error } = await supabase
+        .from("subscriptions")
+        .select("id")
+        .eq("status", "active")
+        .lt("end_date", now);
+      if (error) throw error;
+      let expiredCount = 0;
+      for (const sub of expiredSubs || []) {
+        const result = await expireSubscription(sub.id);
+        if (result.success) expiredCount++;
+      }
+      return jsonResponse({ success: true, expired: expiredCount }, 200, origin);
+    } catch (e: unknown) {
+      return jsonResponse({ error: e instanceof Error ? e.message : "Failed" }, 500, origin);
+    }
+  }
+
   if (path.endsWith("/test-bot") && method === "GET") {
+    const diagnosticUser = await validateInitData(req.headers.get("x-telegram-initdata") || "");
+    if (!diagnosticUser?.id || String(diagnosticUser.id) !== String(ADMIN_TELEGRAM_ID)) {
+      return jsonResponse({ error: "Not found" }, 404, origin);
+    }
     const chatId = url.searchParams.get("chat_id");
     const message = url.searchParams.get("message") || "Test message";
-    if (!chatId) return jsonResponse({ error: "Missing chat_id" }, 400, origin);
+    if (!chatId || !/^-?\d+$/.test(chatId)) return jsonResponse({ error: "Invalid chat_id" }, 400, origin);
     try {
       const result = await telegramApi("sendMessage", { chat_id: parseInt(chatId), text: message });
       return jsonResponse({ success: result.ok, message_id: result.result?.message_id, error: result.ok ? null : result.description }, result.ok ? 200 : 500, origin);
@@ -1364,7 +1619,7 @@ serve(async (req: Request) => {
     }
   }
   
-  return new Response("MySubHub API v2.4.1", { headers: getCorsHeaders(origin) });
+  return new Response("MySubHub API v2.5.1 - ESCROW HARDENED", { headers: getCorsHeaders(origin) });
 });
 
 async function autoSetup() {
@@ -1397,4 +1652,4 @@ async function autoSetup() {
 }
 
 autoSetup();
-console.log("✅ MySubHub Backend v2.4.1 started");
+console.log("✅ MySubHub Backend v2.5.1 started");
