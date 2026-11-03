@@ -1,4 +1,4 @@
-// MySubHub Backend v2.5.1 - PAYMENT AND ESCROW HARDENING
+// MySubHub Backend v2.6.1 - COORDINATED SECURITY AND REFERRAL REPAIR
 // Fixed: Edit channel price, admin channels tab visibility, forward button, expiration cron
 // Deploy this to Supabase Edge Functions
 
@@ -8,6 +8,7 @@ import { Address, beginCell } from "https://esm.sh/@ton/core@0.59.0";
 
 // ================== CONFIG ==================
 const BOT_TOKEN = Deno.env.get("BOT_TOKEN");
+const BOT_USERNAME = (Deno.env.get("BOT_USERNAME") || "MySubsHub_bot").replace(/^@/, "");
 const ADMIN_TELEGRAM_ID = Deno.env.get("ADMIN_TELEGRAM_ID");
 const ADMIN_TON_WALLET = Deno.env.get("ADMIN_TON_WALLET");
 const TONCENTER_API_KEY = Deno.env.get("TONCENTER_API_KEY");
@@ -18,9 +19,8 @@ const TON_NETWORK = (Deno.env.get("TON_NETWORK") || "testnet").trim().toLowerCas
 if (TON_NETWORK !== "testnet" && TON_NETWORK !== "mainnet") {
   throw new Error(`Invalid TON_NETWORK "${TON_NETWORK}". Set it to "testnet" or "mainnet".`);
 }
-const REFERRAL_CREDIT_PERCENT = 0.10;
 
-console.log(`🚀 Starting MySubHub Backend v2.5.1 - PAYMENT/ESCROW HARDENING`);
+console.log(`🚀 Starting MySubHub Backend v2.6.1 - COORDINATED REPAIR`);
 console.log(`📡 TON_NETWORK: ${TON_NETWORK}`);
 
 if (!BOT_TOKEN || !ADMIN_TELEGRAM_ID || !ADMIN_TON_WALLET) {
@@ -90,6 +90,31 @@ async function dbRpc(fn: string, params: Record<string, unknown> = {}) {
   return data;
 }
 
+// Award referral credits only through the database's idempotent 10% referral RPC.
+// The stored payment nonce channel_price is authoritative; never trust a client amount.
+async function awardReferralForSubscription(
+  referredUserId: number,
+  subscriptionId: string,
+  channelPriceValue: unknown,
+): Promise<boolean> {
+  const users = await dbSelect("users", { telegram_id: referredUserId }, "referred_by");
+  const referrerId = users[0]?.referred_by;
+  if (referrerId === null || referrerId === undefined) return false;
+
+  const channelPrice = Number(channelPriceValue);
+  if (!Number.isFinite(channelPrice) || channelPrice <= 0) {
+    throw new Error("Stored payment channel price is invalid; referral award remains pending");
+  }
+
+  await dbRpc("award_referral_credits", {
+    p_referrer_id: Number(referrerId),
+    p_referred_id: referredUserId,
+    p_subscription_id: subscriptionId,
+    p_subscription_amount: Number(channelPrice.toFixed(9)),
+  });
+  return true;
+}
+
 // ================== UTILITIES ==================
 function isValidUUID(str: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str);
@@ -107,9 +132,8 @@ function escapeHtml(str: string): string {
 
 function generateReferralCode(): string {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  let code = '';
-  for (let i = 0; i < 8; i++) code += chars.charAt(Math.floor(Math.random() * chars.length));
-  return code;
+  const bytes = crypto.getRandomValues(new Uint8Array(8));
+  return Array.from(bytes, (byte) => chars[byte % chars.length]).join('');
 }
 
 // ================== CORS ==================
@@ -335,47 +359,60 @@ async function verifyTonPayout(
   }
 }
 
-// ================== BOT ADMIN VERIFICATION ==================
-async function verifyBotIsAdmin(channelInviteLink: string): Promise<{ success: boolean; error?: string }> {
+// ================== CHANNEL OWNERSHIP VERIFICATION ==================
+async function verifyBotAndOwnerAreAdmins(
+  channelChatId: number,
+  ownerTelegramId: number,
+): Promise<{ success: boolean; error?: string }> {
   try {
-    const match = channelInviteLink.match(/t\.me\/\+?([a-zA-Z0-9_]+)/);
-    if (!match) {
-      return { success: false, error: "Invalid invite link format" };
+    if (!Number.isSafeInteger(channelChatId) || !Number.isSafeInteger(ownerTelegramId)) {
+      return { success: false, error: "Invalid Telegram channel or owner ID" };
     }
-    
-    const channelIdentifier = match[1];
-    const chatInfo = await telegramApi("getChat", { chat_id: channelIdentifier });
-    
-    if (!chatInfo.ok) {
-      return { success: false, error: "Could not access channel. Make sure the invite link is correct and the bot can access it." };
+    const me = await telegramApi("getMe");
+    if (!me.ok || !me.result?.id) {
+      return { success: false, error: "Unable to identify the MySubHub bot" };
     }
-    
-    const chatId = chatInfo.result.id;
-    const botMember = await telegramApi("getChatMember", { 
-      chat_id: chatId, 
-      user_id: (await telegramApi("getMe")).result.id 
-    });
-    
-    if (!botMember.ok) {
-      return { success: false, error: "Bot is not a member of this channel" };
+
+    const [botMember, ownerMember] = await Promise.all([
+      telegramApi("getChatMember", { chat_id: channelChatId, user_id: me.result.id }),
+      telegramApi("getChatMember", { chat_id: channelChatId, user_id: ownerTelegramId }),
+    ]);
+
+    if (!botMember.ok || !["administrator", "creator"].includes(String(botMember.result?.status))) {
+      return { success: false, error: "MySubHub bot must be an administrator of this channel or group" };
     }
-    
-    const status = botMember.result.status;
-    
-    if (status !== "administrator" && status !== "creator") {
-      return { 
-        success: false, 
-        error: "Bot must be added as administrator to this channel first. Please add the bot as admin and try again." 
-      };
+    if (botMember.result?.status !== "creator" &&
+        (botMember.result?.can_invite_users !== true || botMember.result?.can_restrict_members !== true)) {
+      return { success: false, error: "MySubHub bot needs invite-users and restrict-members administrator permissions" };
     }
-    
+    if (!ownerMember.ok || !["administrator", "creator"].includes(String(ownerMember.result?.status))) {
+      return { success: false, error: "You must be a channel or group administrator to register it" };
+    }
     return { success: true };
   } catch (e: unknown) {
-    return { 
-      success: false, 
-      error: "Failed to verify bot admin status. Please ensure the bot has been added as administrator to your channel." 
-    };
+    console.error("Channel ownership verification failed:", e);
+    return { success: false, error: "Unable to verify channel administrator permissions" };
   }
+}
+
+async function createSubscriberInviteLink(
+  channelChatId: number,
+  subscriptionId: string,
+  endDate: string,
+): Promise<string | null> {
+  const expiry = Math.floor(Date.parse(endDate) / 1000);
+  if (!Number.isFinite(expiry) || expiry <= Math.floor(Date.now() / 1000)) return null;
+  const result = await telegramApi("createChatInviteLink", {
+    chat_id: channelChatId,
+    expire_date: expiry,
+    member_limit: 1,
+    name: `MySubHub ${subscriptionId.slice(0, 8)}`,
+  });
+  if (!result.ok || typeof result.result?.invite_link !== "string") {
+    console.error("Could not create subscriber-specific invite link:", result.description || "Unknown Telegram error");
+    return null;
+  }
+  return result.result.invite_link as string;
 }
 
 // ================== SUBSCRIPTION EXPIRATION ==================
@@ -383,52 +420,78 @@ async function expireSubscription(subId: string) {
   try {
     const subs = await dbSelect("subscriptions", { id: subId });
     if (subs.length === 0) return { success: false, error: "Subscription not found" };
-    
-    const sub = subs[0];
-    const userId = sub.user_id as number;
-    const channelId = sub.channel_id as string;
-    
+    const sub = subs[0] as Record<string, unknown>;
+    if (sub.status !== "active") return { success: true, alreadyExpired: true };
+    if (Date.parse(String(sub.end_date || "")) > Date.now()) {
+      return { success: false, error: "Subscription has not expired yet" };
+    }
+
+    const userId = Number(sub.user_id);
+    const channelId = String(sub.channel_id);
     const channels = await dbSelect("channels", { id: channelId });
     if (channels.length === 0) return { success: false, error: "Channel not found" };
-    
-    const channel = channels[0];
-    const channelChatId = channel.channel_chat_id as number;
-    
-    await dbUpdate("subscriptions", { id: subId }, { 
-      status: 'expired',
-      updated_at: new Date().toISOString()
-    });
-    
-    if (channelChatId) {
-      try {
-        await telegramApi("banChatMember", {
-          chat_id: channelChatId,
-          user_id: userId,
-          revoke_messages: false
-        });
-        console.log(`✅ User ${userId} removed from channel ${channelChatId}`);
-      } catch (e) {
-        console.error(`❌ Failed to remove user:`, e);
+    const channel = channels[0] as Record<string, unknown>;
+    const channelChatId = Number(channel.channel_chat_id);
+    if (!Number.isSafeInteger(channelChatId)) {
+      return { success: false, error: "Channel Telegram chat ID is missing; access cannot be verified" };
+    }
+
+    // Do not mark the subscription expired until Telegram confirms that access is removed.
+    const member = await telegramApi("getChatMember", { chat_id: channelChatId, user_id: userId });
+    if (!member.ok) {
+      return { success: false, error: `Unable to verify Telegram membership: ${member.description || "unknown error"}` };
+    }
+    const memberStatus = String(member.result?.status || "");
+    if (memberStatus === "creator" || memberStatus === "administrator") {
+      return { success: false, error: "Subscriber has administrator privileges; refusing automatic removal" };
+    }
+    if (memberStatus !== "left" && memberStatus !== "kicked") {
+      const banned = await telegramApi("banChatMember", {
+        chat_id: channelChatId,
+        user_id: userId,
+        revoke_messages: false,
+      });
+      if (!banned.ok) {
+        return { success: false, error: `Telegram removal failed: ${banned.description || "unknown error"}` };
       }
     }
-    
+
+    const oldInvite = typeof sub.access_invite_link === "string" ? sub.access_invite_link : "";
+    if (oldInvite) {
+      const revoked = await telegramApi("revokeChatInviteLink", {
+        chat_id: channelChatId,
+        invite_link: oldInvite,
+      });
+      if (!revoked.ok) console.warn("Could not revoke old subscriber invite link:", revoked.description);
+    }
+
+    const updated = await dbUpdate("subscriptions", { id: subId, status: "active" }, {
+      status: "expired",
+      access_invite_link: null,
+      access_invite_expires_at: null,
+      updated_at: new Date().toISOString(),
+    });
+    if (!updated.length) {
+      const latest = await dbSelect("subscriptions", { id: subId });
+      if (latest[0]?.status !== "expired") return { success: false, error: "Subscription status changed concurrently" };
+    }
+
     try {
       await telegramApi("sendMessage", {
         chat_id: userId,
-        text: `⚠️ Your subscription to "${escapeHtml(channel.channel_name as string)}" has expired.\n\nRenew it from the app!`,
+        text: `Your subscription to "${String(channel.channel_name || "channel")}" has expired. Renew it from MySubHub.`,
         reply_markup: {
           inline_keyboard: [[
-            { text: "🔄 Renew", web_app: { url: `${WEBAPP_URL}?startapp=${channelId}` } }
-          ]]
-        }
+            { text: "Renew subscription", web_app: { url: `${WEBAPP_URL}?startapp=${channelId}` } },
+          ]],
+        },
       });
     } catch (e) {
-      console.error("Failed to notify user:", e);
+      console.warn("Failed to notify expired subscriber:", e);
     }
-    
     return { success: true, userId, channelId };
   } catch (e: unknown) {
-    return { success: false, error: e instanceof Error ? e.message : 'Unknown' };
+    return { success: false, error: e instanceof Error ? e.message : "Unknown error" };
   }
 }
 
@@ -545,7 +608,22 @@ async function handleBotUpdate(body: Record<string, unknown>) {
       let url = WEBAPP_URL;
       let msgText = `Welcome, ${escapeHtml(from.first_name as string || 'User')}! 🎉`;
       let btnText = "🚀 Open Dashboard";
-      
+
+      // Compatibility path only: the production Telegram webhook is the Node bot service.
+      // If this Edge webhook is used in a migration window, it records referral attribution
+      // through the same service-role RPC and never overwrites an existing referrer.
+      if (/^ref_[A-Za-z0-9]{8}$/.test(parts)) {
+        try {
+          const attributed = await dbRpc("set_referral_attribution", {
+            p_referred_user_id: telegramId,
+            p_referral_code: parts.slice(4),
+          });
+          if (attributed !== true) console.info(`Referral attribution not applied for Telegram user ${telegramId}`);
+        } catch (error) {
+          console.error("Referral attribution RPC failed:", error);
+        }
+      }
+
       if (parts === "owner") { url += "?startapp=owner"; btnText = "📺 My Channels"; }
       else if (parts.startsWith("ref_")) { url += "?startapp=referral"; }
       else if (parts && isValidUUID(parts)) { url += `?startapp=${parts}`; msgText = "Subscribe to this channel:"; btnText = "💎 Subscribe"; }
@@ -572,8 +650,11 @@ async function handleBotUpdate(body: Record<string, unknown>) {
     if (newStatus === "administrator" && ["channel", "group", "supergroup"].includes(chatType)) {
       let inviteLink = "";
       try {
-        const res = await telegramApi("exportChatInviteLink", { chat_id: chatId });
-        if (res.ok) inviteLink = res.result as string;
+        const res = await telegramApi("createChatInviteLink", {
+          chat_id: chatId,
+          name: "MySubHub owner setup",
+        });
+        if (res.ok) inviteLink = res.result.invite_link as string;
       } catch {}
       
       try {
@@ -589,20 +670,24 @@ async function handleBotUpdate(body: Record<string, unknown>) {
             channel_invite_link: inviteLink,
             subscription_price: 0.1,
             duration_days: 30,
-            is_active: true,
+            is_active: false,
           });
           channelId = result?.[0]?.id;
         } else {
+          const existingOwner = Number(existing[0].owner_id || 0);
+          if (existingOwner && existingOwner !== Number(from.id)) {
+            console.warn(`Channel ${chatId} is already assigned to another MySubHub owner; refusing transfer`);
+            return;
+          }
           await dbUpdate("channels", { channel_chat_id: chatId }, {
-            channel_chat_id: chatId,
+            owner_id: from.id,
             channel_invite_link: inviteLink || undefined,
-            is_active: true,
             channel_name: chat.title || "Unknown",
           });
           channelId = existing[0].id as string;
         }
         
-        const shareLink = `https://t.me/${BOT_TOKEN?.split(':')[0]}?start=${channelId}`;
+        const shareLink = `https://t.me/${BOT_USERNAME}?start=${channelId}`;
         
         await telegramApi("sendMessage", {
           chat_id: from.id as number,
@@ -622,7 +707,7 @@ async function handleBotUpdate(body: Record<string, unknown>) {
 }
 
 // ================== API HANDLER ==================
-async function apiHandler(path: string, method: string, headers: Headers, body: Record<string, unknown>, origin: string | null) {
+async function apiHandler(path: string, method: string, headers: Headers, body: Record<string, unknown>, origin: string | null, requestUrl: URL) {
   const initData = headers.get("x-telegram-initdata") || "";
   const tgUser = await validateInitData(initData);
   
@@ -694,88 +779,53 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
     }
   }
   
-  // ================== CHANNEL DISCOVERY (PUBLIC) ==================
+  // ================== CHANNEL DISCOVERY ==================
   if (path === "/api/channels/discover" && method === "GET") {
     try {
-      const url = new URL(`https://dummy.com${path}`);
-      const search = url.searchParams.get("search") || "";
-      const category = url.searchParams.get("category") || "";
-      const sort = url.searchParams.get("sort") || "popular";
-      const limit = parseInt(url.searchParams.get("limit") || "20");
-      const offset = parseInt(url.searchParams.get("offset") || "0");
-      
-      // Get all active channels
-      let channels = await dbSelect("channels", { is_active: true });
-      
-      // Filter by search term
-      if (search) {
-        const searchLower = search.toLowerCase();
-        channels = channels.filter((ch: Record<string, unknown>) => 
-          (ch.channel_name as string).toLowerCase().includes(searchLower) ||
-          (ch.description as string || '').toLowerCase().includes(searchLower)
-        );
-      }
-      
-      // Filter by category
-      if (category) {
-        channels = channels.filter((ch: Record<string, unknown>) => 
-          ch.category === category
-        );
-      }
-      
-      // Enrich with stats
-      const enriched = await Promise.all(channels.map(async (ch: Record<string, unknown>) => {
-        try {
-          const activeSubs = await dbSelect("subscriptions", { channel_id: ch.id as string, status: 'active' });
-          const reviews = await dbSelect("reviews", { channel_id: ch.id as string });
-          const visibleReviews = reviews.filter((r: Record<string, unknown>) => !r.is_hidden);
-          const avgRating = visibleReviews.length > 0
-            ? visibleReviews.reduce((sum: number, r: Record<string, unknown>) => sum + (r.rating as number), 0) / visibleReviews.length
-            : 0;
-          
-          return {
-            id: ch.id,
-            channel_name: escapeHtml(ch.channel_name as string),
-            description: escapeHtml(ch.description as string || ''),
-            category: ch.category || 'other',
-            subscription_price: ch.subscription_price,
-            duration_days: ch.duration_days,
-            is_verified: ch.is_verified,
-            active_subscribers: activeSubs.length,
-            avg_rating: Math.round(avgRating * 10) / 10,
-            review_count: visibleReviews.length,
-            created_at: ch.created_at,
-          };
-        } catch { return ch; }
+      const search = (requestUrl.searchParams.get("search") || "").trim().toLowerCase();
+      const category = (requestUrl.searchParams.get("category") || "").trim();
+      const sort = requestUrl.searchParams.get("sort") || "popular";
+      const requestedLimit = Number.parseInt(requestUrl.searchParams.get("limit") || "20", 10);
+      const requestedOffset = Number.parseInt(requestUrl.searchParams.get("offset") || "0", 10);
+      const limit = Number.isFinite(requestedLimit) ? Math.min(50, Math.max(1, requestedLimit)) : 20;
+      const offset = Number.isFinite(requestedOffset) ? Math.max(0, requestedOffset) : 0;
+
+      const rows = await dbSelect("channel_stats", { is_active: true });
+      let channels = rows.filter((row: Record<string, unknown>) => {
+        const name = String(row.channel_name || "").toLowerCase();
+        const description = String(row.description || "").toLowerCase();
+        const matchesSearch = !search || name.includes(search) || description.includes(search);
+        const matchesCategory = !category || row.category === category;
+        return matchesSearch && matchesCategory;
+      });
+
+      if (sort === "rating") channels.sort((a: any, b: any) => Number(b.avg_rating || 0) - Number(a.avg_rating || 0));
+      else if (sort === "recent") channels.sort((a: any, b: any) => Date.parse(String(b.created_at || 0)) - Date.parse(String(a.created_at || 0)));
+      else if (sort === "price_low") channels.sort((a: any, b: any) => Number(a.subscription_price || 0) - Number(b.subscription_price || 0));
+      else if (sort === "price_high") channels.sort((a: any, b: any) => Number(b.subscription_price || 0) - Number(a.subscription_price || 0));
+      else channels.sort((a: any, b: any) => Number(b.active_subscribers || 0) - Number(a.active_subscribers || 0));
+
+      const total = channels.length;
+      const paginated = channels.slice(offset, offset + limit).map((ch: Record<string, unknown>) => ({
+        id: ch.id,
+        channel_name: escapeHtml(String(ch.channel_name || "")),
+        description: escapeHtml(String(ch.description || "")),
+        category: ch.category || "other",
+        subscription_price: ch.subscription_price,
+        duration_days: ch.duration_days,
+        is_verified: ch.is_verified,
+        active_subscribers: Number(ch.active_subscribers || 0),
+        avg_rating: Number(ch.avg_rating || 0),
+        review_count: Number(ch.review_count || 0),
+        created_at: ch.created_at,
       }));
-      
-      // Sort
-      if (sort === "popular") {
-        enriched.sort((a: any, b: any) => b.active_subscribers - a.active_subscribers);
-      } else if (sort === "rating") {
-        enriched.sort((a: any, b: any) => b.avg_rating - a.avg_rating);
-      } else if (sort === "recent") {
-        enriched.sort((a: any, b: any) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
-      } else if (sort === "price_low") {
-        enriched.sort((a: any, b: any) => parseFloat(a.subscription_price) - parseFloat(b.subscription_price));
-      } else if (sort === "price_high") {
-        enriched.sort((a: any, b: any) => parseFloat(b.subscription_price) - parseFloat(a.subscription_price));
-      }
-      
-      // Paginate
-      const paginated = enriched.slice(offset, offset + limit);
-      
-      return jsonResponse({
-        channels: paginated,
-        total: enriched.length,
-        limit,
-        offset
-      }, 200, origin);
+      return jsonResponse({ channels: paginated, total, limit, offset }, 200, origin);
     } catch (e: unknown) {
-      return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
+      console.error("Channel discovery failed:", e);
+      return jsonResponse({ error: "Failed to load channels" }, 500, origin);
     }
   }
-  
+
   // ================== CATEGORIES ==================
   if (path === "/api/categories" && method === "GET") {
     try {
@@ -853,40 +903,60 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
   }
   
   if (path === "/api/channels/register" && method === "POST") {
-    const { channel_name, channel_invite_link, subscription_price, duration_days } = body;
-    if (!channel_name || !channel_invite_link) return jsonResponse({ error: "Name and invite link required" }, 400, origin);
-    if (!subscription_price || (subscription_price as number) <= 0) return jsonResponse({ error: "Invalid price" }, 400, origin);
+    const channelName = typeof body.channel_name === "string" ? body.channel_name.trim() : "";
+    const inviteLink = typeof body.channel_invite_link === "string" ? body.channel_invite_link.trim() : "";
+    const price = Number(body.subscription_price);
+    const duration = Number(body.duration_days);
     const validDurations = [7, 30, 90, 180, 365, 9999];
-    if (!duration_days || !validDurations.includes(duration_days as number)) {
-      return jsonResponse({ error: "Invalid duration. Must be 7, 30, 90, 180, 365, or 9999 days" }, 400, origin);
+    const validCategories = ["crypto", "news", "education", "entertainment", "sports", "technology", "business", "lifestyle", "gaming", "music", "other"];
+
+    if (!channelName || channelName.length > 100 || !inviteLink || inviteLink.length > 256) {
+      return jsonResponse({ error: "Provide a valid channel name and the invite link generated when you added MySubHub" }, 400, origin);
     }
+    if (!/^https:\/\/t\.me\//i.test(inviteLink)) {
+      return jsonResponse({ error: "Invalid Telegram invite link" }, 400, origin);
+    }
+    if (!Number.isFinite(price) || price <= 0 || price > 1000000) {
+      return jsonResponse({ error: "Invalid subscription price" }, 400, origin);
+    }
+    if (!Number.isInteger(duration) || !validDurations.includes(duration)) {
+      return jsonResponse({ error: "Invalid duration. Choose 7, 30, 90, 180, 365, or 9999 days" }, 400, origin);
+    }
+
     try {
-      const userChannels = await dbSelect("channels", { owner_id: telegramId });
-      if (userChannels.length >= 5) {
-        return jsonResponse({ error: "Maximum channel limit reached. You can only add up to 5 channels." }, 400, origin);
+      const ownerChannels = await dbSelect("channels", { owner_id: telegramId });
+      const matchingLink = ownerChannels.find((ch: Record<string, unknown>) =>
+        String(ch.channel_invite_link || "").trim() === inviteLink
+      ) as Record<string, unknown> | undefined;
+      if (!matchingLink || !matchingLink.channel_chat_id) {
+        return jsonResponse({ error: "Channel not found. Add @MySubsHub_bot as an administrator first, then use the invite link it sends you." }, 404, origin);
       }
-      
-      const botAdminCheck = await verifyBotIsAdmin(channel_invite_link as string);
-      if (!botAdminCheck.success) {
-        return jsonResponse({ 
-          error: botAdminCheck.error || "Bot must be added as administrator to this channel first." 
-        }, 400, origin);
+      if (ownerChannels.length > 5 && !matchingLink.is_active) {
+        return jsonResponse({ error: "Maximum channel limit reached. You can manage up to 5 channels." }, 400, origin);
       }
-      
-      const result = await dbInsert("channels", {
-        owner_id: telegramId,
-        channel_name,
-        channel_invite_link,
-        subscription_price,
-        duration_days: duration_days,
-        is_active: false,
+
+      const permissionCheck = await verifyBotAndOwnerAreAdmins(Number(matchingLink.channel_chat_id), telegramId);
+      if (!permissionCheck.success) {
+        return jsonResponse({ error: permissionCheck.error || "Channel administrator verification failed" }, 403, origin);
+      }
+
+      const category = validCategories.includes(String(body.category || "other")) ? String(body.category || "other") : "other";
+      const updated = await dbUpdate("channels", { id: matchingLink.id as string, owner_id: telegramId }, {
+        channel_name: channelName,
+        subscription_price: Number(price.toFixed(9)),
+        duration_days: duration,
+        category,
+        is_active: true,
+        updated_at: new Date().toISOString(),
       });
-      return jsonResponse(result?.[0] || { success: true }, 201, origin);
+      if (!updated.length) return jsonResponse({ error: "Channel configuration could not be saved" }, 409, origin);
+      return jsonResponse(updated[0], 200, origin);
     } catch (e: unknown) {
-      return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
+      console.error("Channel registration failed:", e);
+      return jsonResponse({ error: e instanceof Error ? e.message : "Channel registration failed" }, 500, origin);
     }
   }
-  
+
   if (path.match(/^\/api\/channels\/[a-f0-9-]+$/) && method === "PUT") {
     const channelId = path.split("/")[3];
     if (!isValidUUID(channelId)) return jsonResponse({ error: "Invalid channel ID" }, 400, origin);
@@ -895,17 +965,20 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       const channels = await dbSelect("channels", { id: channelId, owner_id: telegramId });
       if (channels.length === 0) return jsonResponse({ error: "Channel not found" }, 404, origin);
       const updateBody: Record<string, unknown> = { updated_at: new Date().toISOString() };
+      const validDurations = [7, 30, 90, 180, 365, 9999];
       if (subscription_price !== undefined && subscription_price !== null) {
-        const parsedPrice = parseFloat(String(subscription_price));
-        if (!isNaN(parsedPrice) && parsedPrice > 0) {
-          updateBody.subscription_price = parsedPrice;
+        const parsedPrice = Number(subscription_price);
+        if (!Number.isFinite(parsedPrice) || parsedPrice <= 0 || parsedPrice > 1000000) {
+          return jsonResponse({ error: "Invalid subscription price" }, 400, origin);
         }
+        updateBody.subscription_price = Number(parsedPrice.toFixed(9));
       }
       if (duration_days !== undefined && duration_days !== null) {
-        const parsedDuration = parseInt(String(duration_days));
-        if (!isNaN(parsedDuration) && parsedDuration > 0) {
-          updateBody.duration_days = parsedDuration;
+        const parsedDuration = Number(duration_days);
+        if (!Number.isInteger(parsedDuration) || !validDurations.includes(parsedDuration)) {
+          return jsonResponse({ error: "Invalid duration. Choose 7, 30, 90, 180, 365, or 9999 days" }, 400, origin);
         }
+        updateBody.duration_days = parsedDuration;
       }
       const result = await dbUpdate("channels", { id: channelId }, updateBody);
       return jsonResponse(result?.[0] || { success: true }, 200, origin);
@@ -930,7 +1003,19 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       const reviews = await dbSelect("reviews", { channel_id: channelId });
       const visibleReviews = reviews.filter((r: Record<string, unknown>) => !r.is_hidden);
       
-      return jsonResponse({ ...channel, reviews: visibleReviews }, 200, origin);
+      const publicChannel = {
+        id: channel.id,
+        channel_name: channel.channel_name,
+        description: channel.description,
+        category: channel.category,
+        subscription_price: channel.subscription_price,
+        duration_days: channel.duration_days,
+        is_verified: channel.is_verified,
+        channel_type: channel.channel_type,
+        avg_rating: channel.avg_rating,
+        total_reviews: channel.total_reviews,
+      };
+      return jsonResponse({ ...publicChannel, reviews: visibleReviews }, 200, origin);
     } catch (e: unknown) {
       return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
     }
@@ -941,41 +1026,123 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
     if (!isValidUUID(channelId)) return jsonResponse({ error: "Invalid channel ID" }, 400, origin);
     try {
       const channels = await dbSelect("channels", { id: channelId, owner_id: telegramId });
-      if (channels.length === 0) return jsonResponse({ error: "Channel not found or unauthorized" }, 404, origin);
-      
-      await dbDelete("subscriptions", { channel_id: channelId });
-      await dbDelete("reviews", { channel_id: channelId });
-      await dbDelete("reports", { reported_channel_id: channelId });
-      await dbDelete("platform_transactions", { channel_id: channelId });
-      await dbDelete("channels", { id: channelId });
-      
-      console.log(`✅ Channel ${channelId} deleted by user ${telegramId}`);
-      return jsonResponse({ success: true, message: "Channel deleted successfully" }, 200, origin);
+      const channel = channels[0] as Record<string, unknown> | undefined;
+      if (!channel) return jsonResponse({ error: "Channel not found or unauthorized" }, 404, origin);
+
+      // Keep all subscriptions, financial ledger records, reviews and reports.
+      const updated = await dbUpdate("channels", { id: channelId, owner_id: telegramId }, {
+        is_active: false,
+        updated_at: new Date().toISOString(),
+      });
+      if (!updated.length) return jsonResponse({ error: "Channel state could not be changed" }, 409, origin);
+
+      if (channel.channel_chat_id && channel.channel_invite_link) {
+        const revoke = await telegramApi("revokeChatInviteLink", {
+          chat_id: channel.channel_chat_id,
+          invite_link: channel.channel_invite_link,
+        });
+        if (!revoke.ok) console.warn("Could not revoke managed channel invite link:", revoke.description);
+      }
+
+      return jsonResponse({
+        success: true,
+        deactivated: true,
+        message: "Channel deactivated. Existing paid subscriptions and financial history were preserved.",
+      }, 200, origin);
     } catch (e: unknown) {
-      return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
+      console.error("Channel deactivation failed:", e);
+      return jsonResponse({ error: "Channel could not be deactivated" }, 500, origin);
     }
   }
-  
+
   if (path === "/api/subscriptions/my" && method === "GET") {
     try {
       const subs = await dbSelect("subscriptions", { user_id: telegramId });
       const enriched = await Promise.all(subs.map(async (sub: Record<string, unknown>) => {
         try {
           const channels = await dbSelect("channels", { id: sub.channel_id as string });
-          const isExpired = sub.status === 'expired' || new Date(sub.end_date as string) < new Date();
-          return { 
-            ...sub, 
-            channel: channels[0] || null,
-            is_expired: isExpired
+          const ch = channels[0] as Record<string, unknown> | undefined;
+          const safeChannel = ch ? {
+            id: ch.id,
+            channel_name: ch.channel_name,
+            is_verified: ch.is_verified,
+            channel_type: ch.channel_type,
+            subscription_price: ch.subscription_price,
+            duration_days: ch.duration_days,
+          } : null;
+          const isExpired = sub.status === "expired" || Date.parse(String(sub.end_date)) < Date.now();
+          return {
+            ...sub,
+            channel: safeChannel,
+            access_invite_link: isExpired ? null : (sub.access_invite_link || null),
+            is_expired: isExpired,
           };
-        } catch { return { ...sub, channel: null, is_expired: false }; }
+        } catch {
+          return { ...sub, channel: null, access_invite_link: null, is_expired: false };
+        }
       }));
       return jsonResponse(enriched, 200, origin);
     } catch (e: unknown) {
-      return jsonResponse({ error: e instanceof Error ? e.message : 'Failed' }, 500, origin);
+      return jsonResponse({ error: e instanceof Error ? e.message : "Failed" }, 500, origin);
     }
   }
-  
+
+  // Generate or refresh a one-person invite link for this subscriber only.
+  if (path.match(/^\/api\/subscriptions\/[a-f0-9-]+\/access-link$/) && method === "POST") {
+    const subscriptionId = path.split("/")[3];
+    if (!isValidUUID(subscriptionId)) return jsonResponse({ error: "Invalid subscription ID" }, 400, origin);
+    try {
+      const rows = await dbSelect("subscriptions", { id: subscriptionId, user_id: telegramId });
+      const sub = rows[0] as Record<string, unknown> | undefined;
+      if (!sub) return jsonResponse({ error: "Subscription not found" }, 404, origin);
+      if (sub.status !== "active" || Date.parse(String(sub.end_date || "")) <= Date.now()) {
+        return jsonResponse({ error: "Subscription is expired" }, 403, origin);
+      }
+      const channelRows = await dbSelect("channels", { id: sub.channel_id as string });
+      const channel = channelRows[0] as Record<string, unknown> | undefined;
+      if (!channel || !Number.isSafeInteger(Number(channel.channel_chat_id))) {
+        return jsonResponse({ error: "Channel access is not configured" }, 409, origin);
+      }
+
+      const member = await telegramApi("getChatMember", { chat_id: channel.channel_chat_id, user_id: telegramId });
+      if (!member.ok) {
+        return jsonResponse({ error: "Telegram could not verify your channel membership. Try again shortly." }, 502, origin);
+      }
+      if (["member", "administrator", "creator"].includes(String(member.result?.status)) ||
+          (member.result?.status === "restricted" && member.result?.is_member === true)) {
+        return jsonResponse({ success: true, already_member: true }, 200, origin);
+      }
+      if (member.result?.status === "kicked") {
+        const unban = await telegramApi("unbanChatMember", {
+          chat_id: channel.channel_chat_id,
+          user_id: telegramId,
+          only_if_banned: true,
+        });
+        if (!unban.ok) {
+          return jsonResponse({ error: "Your previous channel restriction could not be removed. Contact the channel owner." }, 502, origin);
+        }
+      }
+
+      const oldLink = typeof sub.access_invite_link === "string" ? sub.access_invite_link : "";
+      if (oldLink) {
+        await telegramApi("revokeChatInviteLink", { chat_id: channel.channel_chat_id, invite_link: oldLink });
+      }
+      const inviteLink = await createSubscriberInviteLink(
+        Number(channel.channel_chat_id), subscriptionId, String(sub.end_date),
+      );
+      if (!inviteLink) return jsonResponse({ error: "Telegram could not create an access link. Please try again." }, 502, origin);
+
+      await dbUpdate("subscriptions", { id: subscriptionId, user_id: telegramId, status: "active" }, {
+        access_invite_link: inviteLink,
+        access_invite_expires_at: String(sub.end_date),
+      });
+      return jsonResponse({ success: true, invite_link: inviteLink }, 200, origin);
+    } catch (e: unknown) {
+      console.error("Subscriber access link generation failed:", e);
+      return jsonResponse({ error: "Could not generate a subscriber access link" }, 500, origin);
+    }
+  }
+
   if (path === "/api/subscriptions/initiate" && method === "POST") {
     const { channel_id, credits_used = 0 } = body;
     if (!channel_id || !isValidUUID(channel_id as string)) {
@@ -1126,11 +1293,23 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
           user_id: telegramId,
         });
         if (alreadyCompleted.length > 0) {
+          let referralRewardPending = false;
+          try {
+            await awardReferralForSubscription(
+              telegramId,
+              String(alreadyCompleted[0].id),
+              intent.channel_price,
+            );
+          } catch (referralError) {
+            referralRewardPending = true;
+            console.error("Referral reward retry failed:", referralError);
+          }
           return jsonResponse({
             success: true,
             subscription: alreadyCompleted[0],
             end_date: alreadyCompleted[0].end_date,
             idempotent: true,
+            referral_reward_pending: referralRewardPending,
           }, 200, origin);
         }
         return jsonResponse({ error: "Payment reference has already been used" }, 409, origin);
@@ -1175,37 +1354,59 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
         throw new Error("Atomic payment completion did not return a subscription");
       }
 
-      // Referral reward is best-effort; the payment/subscription/ledger transaction is already committed.
+      // Referral award is idempotent in PostgreSQL. If it fails after the
+      // subscription commits, return a retryable status; a repeated confirm request
+      // enters the idempotent branch above and retries without charging again.
+      let referralRewardPending = false;
       try {
-        const userRows = await dbSelect("users", { telegram_id: telegramId });
-        const referrerId = userRows[0]?.referred_by;
-        if (referrerId) {
-          const channelPrice = Number(intent.channel_price || channels[0].subscription_price);
-          await dbRpc("add_credits", {
-            p_user_id: referrerId,
-            p_amount: Number((channelPrice * REFERRAL_CREDIT_PERCENT).toFixed(9)),
-            p_description: "Referral credit from subscription",
-            p_reference_id: subscription.id,
-          });
-        }
+        await awardReferralForSubscription(
+          telegramId,
+          String(subscription.id),
+          intent.channel_price,
+        );
       } catch (e) {
-        console.error("Referral credit error:", e);
+        referralRewardPending = true;
+        console.error("Referral credit error (retryable):", e);
       }
 
       const channel = channels[0];
+      let accessInviteLink: string | null = null;
       if (channel.channel_chat_id) {
-        try {
-          await telegramApi("unbanChatMember", {
-            chat_id: channel.channel_chat_id,
-            user_id: telegramId,
-            only_if_banned: true,
-          });
-        } catch (e) {
-          console.error("Failed to restore subscriber access:", e);
+        const unban = await telegramApi("unbanChatMember", {
+          chat_id: channel.channel_chat_id,
+          user_id: telegramId,
+          only_if_banned: true,
+        });
+        if (!unban.ok) {
+          console.error("Could not unban subscriber before issuing access link:", unban.description);
+        } else {
+          accessInviteLink = await createSubscriberInviteLink(
+            Number(channel.channel_chat_id), String(subscription.id), String(subscription.end_date),
+          );
+          if (accessInviteLink) {
+            await dbUpdate("subscriptions", { id: subscription.id, user_id: telegramId }, {
+              access_invite_link: accessInviteLink,
+              access_invite_expires_at: String(subscription.end_date),
+            });
+            try {
+              await telegramApi("sendMessage", {
+                chat_id: telegramId,
+                text: `Your subscription to "${String(channel.channel_name || "the channel")}" is active. Use this personal invite link before it expires: ${accessInviteLink}`,
+              });
+            } catch (notifyError) {
+              console.warn("Could not message subscriber invite link:", notifyError);
+            }
+          }
         }
       }
 
-      return jsonResponse({ success: true, subscription, end_date: subscription.end_date }, 200, origin);
+      return jsonResponse({
+        success: true,
+        subscription: { ...subscription, access_invite_link: accessInviteLink },
+        end_date: subscription.end_date,
+        access_link_pending: Boolean(channel.channel_chat_id && !accessInviteLink),
+        referral_reward_pending: referralRewardPending,
+      }, 200, origin);
     } catch (e: unknown) {
       console.error("Subscription confirmation error:", e);
       const message = e instanceof Error ? e.message : "Failed";
@@ -1247,6 +1448,34 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
     }
   }
   
+  if (path === "/api/notifications/my" && method === "GET") {
+    try {
+      const { data: limited, error } = await supabase
+        .from("notifications")
+        .select("id,user_id,type,title,message,data,read,created_at")
+        .eq("user_id", telegramId)
+        .order("created_at", { ascending: false })
+        .limit(100);
+      if (error) throw error;
+      const rows = limited || [];
+      return jsonResponse({
+        notifications: rows,
+        unread_count: rows.filter((item: Record<string, unknown>) => item.read !== true).length,
+      }, 200, origin);
+    } catch (e: unknown) {
+      return jsonResponse({ error: "Could not load notifications" }, 500, origin);
+    }
+  }
+
+  if (path === "/api/notifications/read" && method === "POST") {
+    try {
+      await dbUpdate("notifications", { user_id: telegramId, read: false }, { read: true });
+      return jsonResponse({ success: true }, 200, origin);
+    } catch (e: unknown) {
+      return jsonResponse({ error: "Could not update notifications" }, 500, origin);
+    }
+  }
+
   if (path === "/api/referrals/stats" && method === "GET") {
     try {
       if (!user.referral_code) {
@@ -1258,14 +1487,14 @@ async function apiHandler(path: string, method: string, headers: Headers, body: 
       const referralCode = user.referral_code as string;
       const stats = await dbSelect("referrals", { referrer_id: telegramId });
       const credits = await dbSelect("referral_credits", { user_id: telegramId });
-      const balance = credits[0]?.balance || 0;
-      const totalEarned = credits[0]?.total_earned || 0;
-      const totalUsed = credits[0]?.total_used || 0;
+      const balance = credits.reduce((sum: number, row: Record<string, unknown>) => sum + Number(row.balance || 0), 0);
+      const totalEarned = credits.reduce((sum: number, row: Record<string, unknown>) => sum + Number(row.total_earned || 0), 0);
+      const totalUsed = credits.reduce((sum: number, row: Record<string, unknown>) => sum + Number(row.total_used || 0), 0);
       const totalCreditsEarned = stats.reduce((sum: number, r: Record<string, unknown>) => sum + parseFloat(r.credits_earned as string || '0'), 0);
       
       return jsonResponse({
         referralCode,
-        referralLink: `https://t.me/${BOT_TOKEN?.split(':')[0]}?start=ref_${referralCode}`,
+        referralLink: `https://t.me/${BOT_USERNAME}?start=ref_${referralCode}`,
         totalReferrals: stats.length,
         totalCreditsEarned,
         currentBalance: balance,
@@ -1537,7 +1766,7 @@ serve(async (req: Request) => {
       
       return jsonResponse({ 
         status: 'healthy', 
-        version: '2.5.1', 
+        version: '2.6.1', 
         timestamp: new Date().toISOString(), 
         network: TON_NETWORK,
         bot: botStatus,
@@ -1612,14 +1841,14 @@ serve(async (req: Request) => {
       if (["POST", "PUT", "PATCH"].includes(method)) {
         try { body = await req.json(); } catch { return jsonResponse({ error: "Invalid JSON" }, 400, origin); }
       }
-      return await apiHandler(apiPath, method, req.headers, body, origin);
+      return await apiHandler(apiPath, method, req.headers, body, origin, url);
     } catch (e) {
       console.error("API error:", e);
       return jsonResponse({ error: "Internal server error" }, 500, origin);
     }
   }
   
-  return new Response("MySubHub API v2.5.1 - ESCROW HARDENED", { headers: getCorsHeaders(origin) });
+  return new Response("MySubHub API v2.6.1 - COORDINATED REPAIR", { headers: getCorsHeaders(origin) });
 });
 
 async function autoSetup() {
@@ -1652,4 +1881,4 @@ async function autoSetup() {
 }
 
 autoSetup();
-console.log("✅ MySubHub Backend v2.5.1 started");
+console.log("✅ MySubHub Backend v2.6.1 started");
